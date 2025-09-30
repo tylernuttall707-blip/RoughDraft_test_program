@@ -1,0 +1,66 @@
+<!DOCTYPE html>
+<link rel="stylesheet" href="styles.css" />
+<!-- OpenCascade (STEP/IGES/BREP → meshes) - loads WASM next to this script on jsDelivr -->
+<script defer crossorigin="anonymous" src="https://cdn.jsdelivr.net/npm/occt-import-js@0.0.23/dist/occt-import-js.js"></script>
+</head>
+<body>
+<header>
+<h1>CAD File Reader</h1>
+<span class="tag">.stl · .stp/.step · (no native .SLDPRT*)</span>
+</header>
+
+
+<div class="wrap">
+<aside class="left">
+<div class="controls">
+<div class="drop" id="drop">
+<div class="inner">
+<div>
+<div style="font-weight:600;">Open CAD Files</div>
+<div class="muted">Drop files here or use the button →</div>
+</div>
+<label class="btn" for="fileInput">Browse…</label>
+<input id="fileInput" type="file" accept=".stl,.STL,.stp,.STP,.step,.STEP,.sldprt,.SLDPRT" multiple>
+</div>
+</div>
+
+
+<div class="row">
+<label for="stlUnit">Units for STL (no units in file):</label>
+<select id="stlUnit">
+<option value="mm" selected>millimeter</option>
+<option value="cm">centimeter</option>
+<option value="m">meter</option>
+<option value="in">inch</option>
+<option value="ft">foot</option>
+</select>
+</div>
+<div class="row">
+<label for="precision">Decimals:</label>
+<input id="precision" type="number" min="0" max="6" step="1" value="3" />
+</div>
+
+
+<div class="card">
+<div class="card-title">Notes</div>
+<div class="warn">*.SLDPRT isn’t supported in-browser. Export to STEP (.stp/.step) or STL.</div>
+<div class="muted small">STEP files use OpenCascade (WASM) in your browser. First STEP load can take a few seconds.</div>
+</div>
+</div>
+
+
+<div class="list" id="results"></div>
+</aside>
+
+
+<main class="right">
+<div id="viewer" class="viewer"></div>
+<div id="loading" class="loader">Loading…</div>
+<footer class="note">Tip: You can load multiple files; click a row to focus that model.</footer>
+</main>
+</div>
+
+
+<script type="module" src="src/app.js"></script>
+</body>
+</html>
