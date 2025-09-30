@@ -20,6 +20,8 @@ const stlUnitEl = document.getElementById('stlUnit');
 
 const models = [];
 
+let occtModulePromise = null;
+
 const unitToMillimeter = {
   mm: 1,
   cm: 10,
@@ -185,6 +187,7 @@ async function loadStep(file) {
     throw new Error('A file must be provided to loadStep.');
   }
 
+  const occt = await ensureOcctModule();
   const uint8 = new Uint8Array(await file.arrayBuffer());
   const params = {
     linearUnit: 'millimeter',
@@ -252,6 +255,69 @@ async function loadStep(file) {
 
   models.push(model);
   activateModel(model);
+}
+
+async function ensureOcctModule() {
+  if (occtModulePromise) {
+    return occtModulePromise;
+  }
+
+  const occtGlobal = window.occt;
+  if (occtGlobal && typeof occtGlobal.ReadStepFile === 'function') {
+    occtModulePromise = Promise.resolve(occtGlobal);
+    return occtModulePromise;
+  }
+
+  const factory = window.occtimportjs;
+  if (typeof factory === 'function') {
+    occtModulePromise = factory().then((module) => {
+      if (module && typeof module.ReadStepFile === 'function') {
+        window.occt = module;
+        return module;
+      }
+      throw new Error('STEP loader returned an invalid module.');
+    });
+    return occtModulePromise;
+  }
+
+  occtModulePromise = new Promise((resolve, reject) => {
+    const start = performance.now();
+    const timeoutMs = 15000;
+
+    const tryResolve = () => {
+      const readyGlobal = window.occt;
+      if (readyGlobal && typeof readyGlobal.ReadStepFile === 'function') {
+        resolve(readyGlobal);
+        return;
+      }
+
+      const readyFactory = window.occtimportjs;
+      if (typeof readyFactory === 'function') {
+        Promise.resolve(readyFactory())
+          .then((module) => {
+            if (module && typeof module.ReadStepFile === 'function') {
+              window.occt = module;
+              resolve(module);
+            } else {
+              reject(new Error('STEP loader returned an invalid module.'));
+            }
+          })
+          .catch(reject);
+        return;
+      }
+
+      if (performance.now() - start > timeoutMs) {
+        reject(new Error('STEP loader failed to initialize.'));
+        return;
+      }
+
+      requestAnimationFrame(tryResolve);
+    };
+
+    tryResolve();
+  });
+
+  return occtModulePromise;
 }
 
 function activateModel(model) {
