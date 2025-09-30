@@ -115,25 +115,28 @@ async function handleFiles(fileList) {
   for (const file of fileList) {
     const name = file.name || 'file';
     const lower = name.toLowerCase();
+    const card = addCard(name, '<div class=\"muted small\">Processing…</div>');
+    card.classList.add('pending');
     try {
       loading?.classList.add('show');
       if (lower.endsWith('.stl')) {
-        await loadStl(file);
+        await loadStl(file, card);
       } else if (lower.endsWith('.step') || lower.endsWith('.stp')) {
-        await loadStep(file);
+        await loadStep(file, card);
       } else {
-        addCard(name, `<div class=\"warn\">Unsupported file type.</div>`);
+        updateCardBody(card, '<div class=\"warn\">Unsupported file type.</div>');
       }
     } catch (error) {
       console.error('Failed to process file.', error);
-      addCard(name, `<div class=\"warn\">Failed to load: ${error.message || error}</div>`);
+      updateCardBody(card, `<div class=\"warn\">Failed to load: ${error.message || error}</div>`);
     } finally {
+      card.classList.remove('pending');
       loading?.classList.remove('show');
     }
   }
 }
 
-async function loadStl(file) {
+async function loadStl(file, card) {
   const arrayBuffer = await file.arrayBuffer();
   const loader = new STLLoader();
   const geometry = loader.parse(arrayBuffer);
@@ -171,18 +174,22 @@ async function loadStl(file) {
 
   const name = `${file.name}`;
   const decimals = parseInt(precisionEl?.value ?? '3', 10) || 3;
-  const card = addCard(name, `<div class=\"ok\">Loaded STL (${unit} → mm).</div>${formatDims(dims, decimals)}`);
+  const bodyHtml = `<div class=\"ok\">Loaded STL (${unit} → mm).</div>${formatDims(dims, decimals)}`;
+  const targetCard = card ?? addCard(name, bodyHtml);
+  updateCardBody(targetCard, bodyHtml);
+  targetCard.classList.remove('pending');
   const model = { name, group, bounds, unit: unit || 'mm', kind: 'stl', helper };
 
-  card.addEventListener('click', () => {
+  targetCard.addEventListener('click', () => {
     activateModel(model);
   });
 
   models.push(model);
   activateModel(model);
+  return targetCard;
 }
 
-async function loadStep(file) {
+async function loadStep(file, card) {
   if (!file) {
     throw new Error('A file must be provided to loadStep.');
   }
@@ -246,15 +253,19 @@ async function loadStep(file) {
 
   const name = `${file.name}`;
   const decimals = parseInt(precisionEl?.value ?? '3', 10) || 3;
-  const card = addCard(name, `<div class=\"ok\">Loaded STEP (converted → mm).</div>${formatDims(dimsMm, decimals)}`);
+  const bodyHtml = `<div class=\"ok\">Loaded STEP (converted → mm).</div>${formatDims(dimsMm, decimals)}`;
+  const targetCard = card ?? addCard(name, bodyHtml);
+  updateCardBody(targetCard, bodyHtml);
+  targetCard.classList.remove('pending');
   const model = { name, group, bounds, unit: 'mm', kind: 'step', helper };
 
-  card.addEventListener('click', () => {
+  targetCard.addEventListener('click', () => {
     activateModel(model);
   });
 
   models.push(model);
   activateModel(model);
+  return targetCard;
 }
 
 async function ensureOcctModule() {
@@ -398,10 +409,19 @@ function addCard(name, bodyHtml) {
   const title = document.createElement('h3');
   title.textContent = name;
   const body = document.createElement('div');
+  body.className = 'card-body';
   body.innerHTML = bodyHtml;
   card.append(title, body);
   resultsEl?.prepend(card);
   return card;
+}
+
+function updateCardBody(card, bodyHtml) {
+  if (!card) return;
+  const body = card.querySelector('.card-body');
+  if (body) {
+    body.innerHTML = bodyHtml;
+  }
 }
 
 export {

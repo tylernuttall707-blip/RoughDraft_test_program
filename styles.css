@@ -44,6 +44,8 @@ select, input[type="number"] { background:#0e1632; border:1px solid #2a3566; col
 
 .list { margin-top: 12px; display:flex; flex-direction:column; gap:8px; }
 .card { background:#0d1530; border:1px solid #232e5d; border-radius:14px; padding:12px; }
+.card.pending { border-style:dashed; border-color:#3d4c88; opacity:0.75; pointer-events:none; }
+.card .card-body { transition: opacity 0.2s ease; }
 .card h3 { margin:0 0 4px 0; font-size:14px; }
 .card-title { font-weight:600; margin-bottom:6px; }
 .dim { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace; font-size: 13px; }
