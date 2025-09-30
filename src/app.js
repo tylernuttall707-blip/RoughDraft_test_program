@@ -1,7 +1,7 @@
 // Three.js via CDN modules (ESM) and helpers from the examples directory.
 import * as THREE from 'https://unpkg.com/three@0.160.0/build/three.module.js';
-import { OrbitControls } from 'https://unpkg.com/three@0.160.0/examples/jsm/controls/OrbitControls.js';
-import { STLLoader } from 'https://unpkg.com/three@0.160.0/examples/jsm/loaders/STLLoader.js';
+import { OrbitControls } from 'https://unpkg.com/three@0.160.0/examples/jsm/controls/OrbitControls.js?module';
+import { STLLoader } from 'https://unpkg.com/three@0.160.0/examples/jsm/loaders/STLLoader.js?module';
 
 const scene = new THREE.Scene();
 scene.background = new THREE.Color(0x0b1020);
