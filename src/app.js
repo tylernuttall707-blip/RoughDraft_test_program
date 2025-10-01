@@ -721,7 +721,7 @@ function summarizeLoop(loop, vertices) {
       { axis: 'z', value: extent.z },
     ].sort((a, b) => a.value - b.value);
     if (axes.length) {
-      const nextValue = axes[1]?.value ?? axes[0].value || 0;
+      const nextValue = axes[1]?.value ?? axes[0].value ?? 0;
       if (axes[0].value <= LOOP_AXIS_IGNORE_TOLERANCE || axes[0].value <= nextValue * 0.2) {
         axisToIgnore = axes[0].axis;
       }
