@@ -52,6 +52,15 @@ select, input[type="number"] { background:#0e1632; border:1px solid #2a3566; col
 .dim small { color: var(--muted); }
 
 
+.metrics { display:flex; flex-direction:column; gap:6px; margin-top:8px; }
+.metric { background: rgba(12, 18, 40, 0.6); border:1px solid #1f2850; border-radius:10px; padding:8px 10px; font-size:12px; line-height:1.4; }
+.metric-label { font-weight:600; color: var(--muted); text-transform: uppercase; letter-spacing:0.5px; font-size:11px; }
+.metric-value { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace; font-size:13px; margin-top:2px; }
+.metric-sub { color: var(--muted); font-size:11px; margin-top:2px; display:block; }
+.metric-list { margin:6px 0 0 14px; padding:0; list-style:disc; color: var(--muted); }
+.metric-list li { margin-bottom:2px; }
+
+
 .warn { color: var(--bad); font-size: 12px; }
 .ok { color: var(--good); font-size: 12px; }
 .muted { color: var(--muted); }

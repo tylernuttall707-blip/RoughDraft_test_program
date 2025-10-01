@@ -131,10 +131,15 @@ async function loadStl(file, card, viewport) {
   bounds.max.multiplyScalar(toMillimeter);
 
   const dims = dimsFromBounds(bounds);
+  const analysis = analyzeModel(group);
 
   const name = `${file.name}`;
   const decimals = parseInt(precisionEl?.value ?? '3', 10) || 3;
-  const bodyHtml = `<div class="ok">Loaded STL (${unit} → mm).</div>${formatDims(dims, decimals)}`;
+  const bodyHtml = [
+    `<div class="ok">Loaded STL (${unit} → mm).</div>`,
+    formatDims(dims, decimals),
+    formatAnalysis(analysis, decimals),
+  ].join('');
   const targetCard = card ?? addCard(name, bodyHtml);
   updateCardBody(targetCard, bodyHtml);
   targetCard.classList.remove('pending');
@@ -210,10 +215,15 @@ async function loadStep(file, card, viewport) {
   }
 
   const dimsMm = dimsFromBounds(bounds);
+  const analysis = analyzeModel(group);
 
   const name = `${file.name}`;
   const decimals = parseInt(precisionEl?.value ?? '3', 10) || 3;
-  const bodyHtml = `<div class="ok">Loaded STEP (converted → mm).</div>${formatDims(dimsMm, decimals)}`;
+  const bodyHtml = [
+    '<div class="ok">Loaded STEP (converted → mm).</div>',
+    formatDims(dimsMm, decimals),
+    formatAnalysis(analysis, decimals),
+  ].join('');
   const targetCard = card ?? addCard(name, bodyHtml);
   updateCardBody(targetCard, bodyHtml);
   targetCard.classList.remove('pending');
@@ -307,6 +317,427 @@ function dimsFromBounds(bounds) {
     mm: size.clone(),
     inch: size.clone().multiplyScalar(0.0393700787),
   };
+}
+
+function analyzeModel(group) {
+  if (!group) {
+    return createEmptyAnalysis();
+  }
+
+  group.updateMatrixWorld(true);
+
+  const perMesh = [];
+  group.traverse((child) => {
+    if (child?.isMesh && child.geometry) {
+      const result = analyzeGeometry(child.geometry, child.matrixWorld);
+      if (result) {
+        perMesh.push(result);
+      }
+    }
+  });
+
+  if (!perMesh.length) {
+    return createEmptyAnalysis();
+  }
+
+  return mergeAnalyses(perMesh);
+}
+
+function createEmptyAnalysis() {
+  return {
+    loops: [],
+    holes: [],
+    openLoops: [],
+    outerPerimeterMm: null,
+    totalBoundaryMm: 0,
+    bend: {
+      totalEdges: 0,
+      candidateEdges: 0,
+      bendCount: 0,
+      sum: 0,
+      min: null,
+      max: null,
+      histogram: new Map(),
+    },
+  };
+}
+
+function analyzeGeometry(geometry, matrixWorld) {
+  const positionAttr = geometry.getAttribute('position');
+  if (!positionAttr) {
+    return null;
+  }
+
+  const indexAttr = geometry.getIndex();
+  const matrix = matrixWorld ?? new THREE.Matrix4();
+
+  const uniqueVertices = [];
+  const vertexMap = new Map();
+  const originalToUnique = new Array(positionAttr.count);
+  const tolerance = 1e-4;
+  const tempVec = new THREE.Vector3();
+  const keyBuffer = new Array(3);
+
+  for (let i = 0; i < positionAttr.count; i += 1) {
+    tempVec.set(positionAttr.getX(i), positionAttr.getY(i), positionAttr.getZ(i));
+    tempVec.applyMatrix4(matrix);
+    keyBuffer[0] = Math.round(tempVec.x / tolerance);
+    keyBuffer[1] = Math.round(tempVec.y / tolerance);
+    keyBuffer[2] = Math.round(tempVec.z / tolerance);
+    const key = keyBuffer.join('|');
+    let uniqueIndex = vertexMap.get(key);
+    if (uniqueIndex === undefined) {
+      uniqueIndex = uniqueVertices.length;
+      vertexMap.set(key, uniqueIndex);
+      uniqueVertices.push(tempVec.clone());
+    }
+    originalToUnique[i] = uniqueIndex;
+  }
+
+  const getEdgeKey = (a, b) => (a < b ? `${a}|${b}` : `${b}|${a}`);
+
+  const faceNormals = [];
+  const edges = new Map();
+  const addEdge = (a, b, faceIdx) => {
+    const key = getEdgeKey(a, b);
+    let edge = edges.get(key);
+    if (!edge) {
+      const length = uniqueVertices[a].distanceTo(uniqueVertices[b]);
+      edge = { a, b, length, faces: [] };
+      edges.set(key, edge);
+    }
+    edge.faces.push(faceIdx);
+  };
+
+  const addFace = (aIdx, bIdx, cIdx, faceIdx) => {
+    const a = uniqueVertices[aIdx];
+    const b = uniqueVertices[bIdx];
+    const c = uniqueVertices[cIdx];
+    if (!a || !b || !c) {
+      return;
+    }
+    const ab = new THREE.Vector3().subVectors(b, a);
+    const ac = new THREE.Vector3().subVectors(c, a);
+    const normal = new THREE.Vector3().crossVectors(ab, ac);
+    if (normal.lengthSq() > 0) {
+      normal.normalize();
+    }
+    faceNormals[faceIdx] = normal;
+    addEdge(aIdx, bIdx, faceIdx);
+    addEdge(bIdx, cIdx, faceIdx);
+    addEdge(cIdx, aIdx, faceIdx);
+  };
+
+  if (indexAttr) {
+    const array = indexAttr.array;
+    for (let i = 0, faceIdx = 0; i < indexAttr.count; i += 3, faceIdx += 1) {
+      const a = originalToUnique[array[i]];
+      const b = originalToUnique[array[i + 1]];
+      const c = originalToUnique[array[i + 2]];
+      if (a === undefined || b === undefined || c === undefined) {
+        continue;
+      }
+      addFace(a, b, c, faceIdx);
+    }
+  } else {
+    for (let i = 0, faceIdx = 0; i < positionAttr.count; i += 3, faceIdx += 1) {
+      const a = originalToUnique[i];
+      const b = originalToUnique[i + 1];
+      const c = originalToUnique[i + 2];
+      if (a === undefined || b === undefined || c === undefined) {
+        continue;
+      }
+      addFace(a, b, c, faceIdx);
+    }
+  }
+
+  const adjacency = new Map();
+  const boundaryEdges = [];
+  edges.forEach((edge) => {
+    if (edge.faces.length <= 1) {
+      boundaryEdges.push(edge);
+      if (!adjacency.has(edge.a)) adjacency.set(edge.a, new Set());
+      if (!adjacency.has(edge.b)) adjacency.set(edge.b, new Set());
+      adjacency.get(edge.a).add(edge.b);
+      adjacency.get(edge.b).add(edge.a);
+    }
+  });
+
+  const loops = [];
+  const visitedEdges = new Set();
+  const findNextNeighbor = (current, prev) => {
+    const neighbors = adjacency.get(current);
+    if (!neighbors) {
+      return null;
+    }
+    for (const neighbor of neighbors) {
+      if (neighbor === prev) continue;
+      const key = getEdgeKey(current, neighbor);
+      if (visitedEdges.has(key)) {
+        continue;
+      }
+      return neighbor;
+    }
+    return null;
+  };
+
+  for (const edge of boundaryEdges) {
+    const initialKey = getEdgeKey(edge.a, edge.b);
+    if (visitedEdges.has(initialKey)) {
+      continue;
+    }
+    const loop = [edge.a];
+    let current = edge.a;
+    let next = edge.b;
+    let closed = false;
+    let guard = 0;
+    while (next !== null && guard < boundaryEdges.length * 4) {
+      guard += 1;
+      loop.push(next);
+      const stepKey = getEdgeKey(current, next);
+      visitedEdges.add(stepKey);
+      if (next === loop[0]) {
+        closed = true;
+        break;
+      }
+      const candidate = findNextNeighbor(next, current);
+      if (candidate === null) {
+        break;
+      }
+      current = next;
+      next = candidate;
+    }
+    loops.push({
+      vertices: loop,
+      closed,
+    });
+  }
+
+  const loopSummaries = loops.map((loop) => summarizeLoop(loop, uniqueVertices));
+  const totalBoundaryMm = loopSummaries.reduce((sum, entry) => sum + entry.lengthMm, 0);
+
+  const bendStats = summarizeBends(edges, faceNormals);
+
+  return {
+    loops: loopSummaries,
+    totalBoundaryMm,
+    bend: bendStats,
+  };
+}
+
+function summarizeLoop(loop, vertices) {
+  const points = loop.closed ? loop.vertices.slice(0, -1) : loop.vertices.slice();
+  const ordered = loop.vertices;
+  let length = 0;
+  for (let i = 0; i < ordered.length - 1; i += 1) {
+    const start = vertices[ordered[i]];
+    const end = vertices[ordered[i + 1]];
+    if (start && end) {
+      length += start.distanceTo(end);
+    }
+  }
+
+  let maxDistSq = 0;
+  for (let i = 0; i < points.length; i += 1) {
+    const a = vertices[points[i]];
+    if (!a) continue;
+    for (let j = i + 1; j < points.length; j += 1) {
+      const b = vertices[points[j]];
+      if (!b) continue;
+      const distSq = a.distanceToSquared(b);
+      if (distSq > maxDistSq) {
+        maxDistSq = distSq;
+      }
+    }
+  }
+
+  const approxDiameterMm = Math.sqrt(Math.max(maxDistSq, 0));
+
+  return {
+    closed: loop.closed,
+    lengthMm: length,
+    approxDiameterMm,
+    vertexCount: points.length,
+  };
+}
+
+function summarizeBends(edges, faceNormals) {
+  let candidateEdges = 0;
+  let bendCount = 0;
+  let sum = 0;
+  let min = null;
+  let max = null;
+  const histogram = new Map();
+
+  edges.forEach((edge) => {
+    if (edge.faces.length === 2) {
+      candidateEdges += 1;
+      const normalA = faceNormals[edge.faces[0]];
+      const normalB = faceNormals[edge.faces[1]];
+      if (!normalA || !normalB) {
+        return;
+      }
+      const dot = THREE.MathUtils.clamp(normalA.dot(normalB), -1, 1);
+      const angleDeg = THREE.MathUtils.radToDeg(Math.acos(dot));
+      if (!Number.isFinite(angleDeg)) {
+        return;
+      }
+      if (angleDeg > 1) {
+        bendCount += 1;
+        sum += angleDeg;
+        min = min === null ? angleDeg : Math.min(min, angleDeg);
+        max = max === null ? angleDeg : Math.max(max, angleDeg);
+        const rounded = Math.round(angleDeg);
+        histogram.set(rounded, (histogram.get(rounded) ?? 0) + 1);
+      }
+    }
+  });
+
+  return {
+    totalEdges: edges.size,
+    candidateEdges,
+    bendCount,
+    sum,
+    min,
+    max,
+    histogram,
+  };
+}
+
+function mergeAnalyses(meshAnalyses) {
+  const combined = createEmptyAnalysis();
+
+  for (const analysis of meshAnalyses) {
+    combined.loops.push(...analysis.loops);
+    combined.totalBoundaryMm += analysis.totalBoundaryMm;
+
+    combined.bend.totalEdges += analysis.bend.totalEdges;
+    combined.bend.candidateEdges += analysis.bend.candidateEdges;
+    combined.bend.bendCount += analysis.bend.bendCount;
+    combined.bend.sum += analysis.bend.sum;
+    if (analysis.bend.min !== null) {
+      combined.bend.min = combined.bend.min === null
+        ? analysis.bend.min
+        : Math.min(combined.bend.min, analysis.bend.min);
+    }
+    if (analysis.bend.max !== null) {
+      combined.bend.max = combined.bend.max === null
+        ? analysis.bend.max
+        : Math.max(combined.bend.max, analysis.bend.max);
+    }
+    analysis.bend.histogram.forEach((count, key) => {
+      combined.bend.histogram.set(key, (combined.bend.histogram.get(key) ?? 0) + count);
+    });
+  }
+
+  const closedLoops = combined.loops.filter((loop) => loop.closed).sort((a, b) => b.lengthMm - a.lengthMm);
+  const openLoops = combined.loops.filter((loop) => !loop.closed);
+  combined.outerPerimeterMm = closedLoops.length ? closedLoops[0].lengthMm : null;
+  combined.holes = closedLoops.length > 1 ? closedLoops.slice(1) : [];
+  combined.openLoops = openLoops;
+
+  return combined;
+}
+
+function formatAnalysis(analysis, decimals) {
+  if (!analysis) {
+    return '';
+  }
+
+  const places = Number.isFinite(decimals) ? Math.max(0, decimals) : 2;
+  const formatMm = (value) => (value === null || value === undefined
+    ? '—'
+    : `${value.toFixed(places)} mm`);
+  const anglePlaces = Math.min(2, places);
+
+  const sections = [];
+
+  if (analysis.outerPerimeterMm !== null) {
+    sections.push(`
+      <div class="metric">
+        <div class="metric-label">Edge perimeter</div>
+        <div class="metric-value">${formatMm(analysis.outerPerimeterMm)}</div>
+      </div>
+    `);
+  } else if (analysis.totalBoundaryMm > 0) {
+    sections.push(`
+      <div class="metric">
+        <div class="metric-label">Edge perimeter</div>
+        <div class="metric-value">No closed boundary detected</div>
+      </div>
+    `);
+  } else {
+    sections.push(`
+      <div class="metric">
+        <div class="metric-label">Edge perimeter</div>
+        <div class="metric-value">Model is watertight</div>
+      </div>
+    `);
+  }
+
+  if (analysis.holes.length) {
+    const holeItems = analysis.holes.slice(0, 5).map((hole, index) => `
+        <li>Hole ${index + 1}: Ø ${formatMm(hole.approxDiameterMm)}
+          <span class="metric-sub">(perimeter ${formatMm(hole.lengthMm)}, ${hole.vertexCount} edges)</span>
+        </li>
+      `).join('');
+    const more = analysis.holes.length > 5 ? `<li class="metric-sub">…${analysis.holes.length - 5} more</li>` : '';
+    sections.push(`
+      <div class="metric">
+        <div class="metric-label">Holes</div>
+        <div class="metric-value">${analysis.holes.length}</div>
+        <ul class="metric-list">${holeItems}${more}</ul>
+      </div>
+    `);
+  } else {
+    sections.push(`
+      <div class="metric">
+        <div class="metric-label">Holes</div>
+        <div class="metric-value">0</div>
+      </div>
+    `);
+  }
+
+  if (analysis.openLoops.length) {
+    const openLength = analysis.openLoops.reduce((sum, loop) => sum + loop.lengthMm, 0);
+    sections.push(`
+      <div class="metric">
+        <div class="metric-label">Open edges</div>
+        <div class="metric-value">${formatMm(openLength)}</div>
+        <div class="metric-sub">${analysis.openLoops.length} open chains</div>
+      </div>
+    `);
+  }
+
+  const bend = analysis.bend;
+  if (bend && bend.candidateEdges > 0) {
+    let bendSummary = '<div class="metric-sub">No bends detected</div>';
+    if (bend.bendCount > 0) {
+      const average = bend.sum / bend.bendCount;
+      bendSummary = `
+        <div class="metric-sub">${bend.bendCount} of ${bend.candidateEdges} shared edges</div>
+        <div class="metric-sub">avg ${average.toFixed(anglePlaces)}°, range ${bend.min?.toFixed(anglePlaces) ?? '—'}° – ${bend.max?.toFixed(anglePlaces) ?? '—'}°</div>
+      `;
+    }
+
+    const histEntries = Array.from(bend.histogram.entries())
+      .sort((a, b) => b[1] - a[1])
+      .slice(0, 5)
+      .map(([angle, count]) => `<li>${angle}° – ${count}</li>`)
+      .join('');
+    const histHtml = histEntries ? `<ul class="metric-list">${histEntries}</ul>` : '';
+
+    sections.push(`
+      <div class="metric">
+        <div class="metric-label">Bend angles</div>
+        <div class="metric-value">${bend.bendCount}</div>
+        ${bendSummary}
+        ${histHtml}
+      </div>
+    `);
+  }
+
+  return `<div class="metrics">${sections.join('')}</div>`;
 }
 
 function createBoundingBoxHelper(bounds) {
