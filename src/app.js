@@ -946,10 +946,14 @@ function dedupeClosedLoops(loopSummaries) {
     return loopSummaries;
   }
 
-  const tolerance = 1e-3;
+  const initialCount = loopSummaries.length;
+
+  // Use a much tighter tolerance for deduplication to avoid merging distinct holes
+  const tolerance = 1e-5;
   const quantize = (value) => Math.round(value / tolerance);
   const seen = new Map();
   const unique = [];
+  let mergedCount = 0;
 
   for (const summary of loopSummaries) {
     if (!summary.closed || !summary.centroid) {
@@ -957,14 +961,20 @@ function dedupeClosedLoops(loopSummaries) {
       continue;
     }
 
-    const { centroid, lengthMm, vertexCount, approxDiameterMm } = summary;
+    const { centroid, lengthMm, vertexCount, approxDiameterMm, layer } = summary;
+
+    // Create a more specific key that includes layer information if available
     const centroidKey = [
       quantize(centroid.x),
       quantize(centroid.y),
       quantize(centroid.z),
     ].join('|');
     const diameterKey = Number.isFinite(approxDiameterMm) ? quantize(approxDiameterMm) : 'nan';
-    const key = `${centroidKey}|${quantize(lengthMm)}|${vertexCount}|${diameterKey}`;
+    const layerKey = layer || 'default';
+
+    // Include layer in the deduplication key to prevent merging holes from different layers
+    const key = `${layerKey}|${centroidKey}|${quantize(lengthMm)}|${vertexCount}|${diameterKey}`;
+
     const existing = seen.get(key);
     if (!existing) {
       seen.set(key, summary);
@@ -972,6 +982,16 @@ function dedupeClosedLoops(loopSummaries) {
       continue;
     }
 
+    // Only merge if centroids are VERY close (within tolerance)
+    const distance = existing.centroid.distanceTo(centroid);
+    if (distance > tolerance * 10) {
+      // Too far apart, treat as separate feature
+      unique.push(summary);
+      continue;
+    }
+
+    // Merge very close duplicates
+    mergedCount++;
     if (existing.centroid && centroid) {
       existing.centroid = existing.centroid.clone().add(centroid).multiplyScalar(0.5);
     }
@@ -983,6 +1003,10 @@ function dedupeClosedLoops(loopSummaries) {
     const newCount = vertexCount != null ? vertexCount : 0;
     existing.vertexCount = Math.max(existingCount, newCount);
     existing.circularity = (existing.circularity + summary.circularity) / 2;
+  }
+
+  if (mergedCount > 0) {
+    console.log(`[DXF Analysis] Deduplicated ${mergedCount} duplicate loops (${initialCount} → ${unique.length})`);
   }
 
   return unique;
