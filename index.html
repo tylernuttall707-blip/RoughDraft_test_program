@@ -6,7 +6,7 @@
 <body>
 <header>
 <h1>CAD File Reader</h1>
-<span class="tag">.stl · .stp/.step · (no native .SLDPRT*)</span>
+<span class="tag">.stl · .stp/.step · .dxf · (no native .SLDPRT*)</span>
 </header>
 
 
@@ -20,7 +20,7 @@
 <div class="muted">Drop files here or use the button →</div>
 </div>
 <label class="btn" for="fileInput">Browse…</label>
-<input id="fileInput" type="file" accept=".stl,.STL,.stp,.STP,.step,.STEP,.sldprt,.SLDPRT" multiple>
+<input id="fileInput" type="file" accept=".stl,.STL,.stp,.STP,.step,.STEP,.dxf,.DXF,.sldprt,.SLDPRT" multiple>
 </div>
 </div>
 
@@ -68,7 +68,8 @@
     "imports": {
       "three": "https://unpkg.com/three@0.160.0/build/three.module.js",
       "three/examples/jsm/controls/OrbitControls.js": "https://unpkg.com/three@0.160.0/examples/jsm/controls/OrbitControls.js",
-      "three/examples/jsm/loaders/STLLoader.js": "https://unpkg.com/three@0.160.0/examples/jsm/loaders/STLLoader.js"
+      "three/examples/jsm/loaders/STLLoader.js": "https://unpkg.com/three@0.160.0/examples/jsm/loaders/STLLoader.js",
+      "three/examples/jsm/loaders/DXFLoader.js": "https://unpkg.com/three@0.160.0/examples/jsm/loaders/DXFLoader.js"
     }
   }
 </script>

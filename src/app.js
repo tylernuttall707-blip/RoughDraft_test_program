@@ -2,6 +2,7 @@
 import * as THREE from 'three';
 import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js';
 import { STLLoader } from 'three/examples/jsm/loaders/STLLoader.js';
+import { DXFLoader } from 'three/examples/jsm/loaders/DXFLoader.js';
 
 const viewerEl = document.getElementById('viewer');
 const resultsEl = document.getElementById('results');
@@ -85,6 +86,9 @@ async function handleFiles(fileList) {
       } else if (lower.endsWith('.step') || lower.endsWith('.stp')) {
         viewport = viewerManager.createViewport(name);
         await loadStep(file, card, viewport);
+      } else if (lower.endsWith('.dxf')) {
+        viewport = viewerManager.createViewport(name);
+        await loadDxf(file, card, viewport);
       } else {
         updateCardBody(card, '<div class="warn">Unsupported file type.</div>');
       }
@@ -160,6 +164,51 @@ async function loadStl(file, card, viewport) {
   viewport.setModel(group, bounds.clone());
 
   const model = { name, group, bounds: bounds.clone(), unit: unit || 'mm', kind: 'stl', viewport, card: targetCard };
+  targetCard.addEventListener('click', () => viewport.focus());
+  models.push(model);
+  return targetCard;
+}
+
+async function loadDxf(file, card, viewport) {
+  if (!file) {
+    throw new Error('A file must be provided to loadDxf.');
+  }
+  if (!viewport) {
+    throw new Error('A viewer window could not be created for this DXF file.');
+  }
+
+  const text = await file.text();
+  const loader = new DXFLoader();
+  const group = loader.parse(text);
+
+  if (!group) {
+    throw new Error('DXF loader produced no geometry.');
+  }
+
+  const bounds = computeBoundsFromGroup(group);
+  if (!bounds) {
+    throw new Error('DXF file contained no drawable entities.');
+  }
+
+  const dimsMm = dimsFromBounds(bounds);
+  const analysis = analyzeModel(group);
+
+  const name = `${file.name}`;
+  const precisionValue = precisionEl && precisionEl.value !== undefined ? precisionEl.value : '3';
+  const decimals = parseInt(precisionValue, 10) || 3;
+  const bodyHtml = [
+    '<div class="ok">Loaded DXF (units assumed millimeter).</div>',
+    formatDims(dimsMm, decimals),
+    formatAnalysis(analysis, decimals),
+  ].join('');
+  const targetCard = card || addCard(name, bodyHtml);
+  updateCardBody(targetCard, bodyHtml);
+  targetCard.classList.remove('pending');
+
+  viewport.setTitle(name);
+  viewport.setModel(group, bounds.clone());
+
+  const model = { name, group, bounds: bounds.clone(), unit: 'mm', kind: 'dxf', viewport, card: targetCard };
   targetCard.addEventListener('click', () => viewport.focus());
   models.push(model);
   return targetCard;
@@ -324,6 +373,44 @@ function computeBoundsFromPositions(positions) {
     bounds.expandByPoint(temp);
   }
   return bounds;
+}
+
+function computeBoundsFromGroup(group) {
+  if (!group || typeof group.traverse !== 'function') {
+    return null;
+  }
+
+  const bounds = new THREE.Box3();
+  const temp = new THREE.Box3();
+  let hasGeometry = false;
+
+  group.updateMatrixWorld(true);
+  group.traverse((child) => {
+    if (!child || !child.isObject3D) {
+      return;
+    }
+    const { geometry } = child;
+    if (!geometry) {
+      return;
+    }
+    if (!geometry.boundingBox) {
+      geometry.computeBoundingBox();
+    }
+    if (!geometry.boundingBox) {
+      return;
+    }
+
+    temp.copy(geometry.boundingBox);
+    temp.applyMatrix4(child.matrixWorld);
+    if (!hasGeometry) {
+      bounds.copy(temp);
+      hasGeometry = true;
+    } else {
+      bounds.union(temp);
+    }
+  });
+
+  return hasGeometry ? bounds : null;
 }
 
 function dimsFromBounds(bounds) {
