@@ -11,7 +11,7 @@ const dropEl = document.getElementById('drop');
 const fileInput = document.getElementById('fileInput');
 const stlUnitEl = document.getElementById('stlUnit');
 
-const viewerManager = new ViewerManager(viewerEl);
+let viewerManager = null;
 const models = [];
 
 let occtModulePromise = null;
@@ -23,9 +23,6 @@ const unitToMillimeter = {
   in: 25.4,
   ft: 304.8,
 };
-
-initViewer();
-attachUiHandlers();
 
 function initViewer() {
   viewerManager.initialize();
@@ -556,6 +553,10 @@ class ModelViewport {
     this.root.remove();
   }
 }
+
+viewerManager = new ViewerManager(viewerEl);
+initViewer();
+attachUiHandlers();
 
 export {
   models,
