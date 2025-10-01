@@ -48,8 +48,9 @@ function attachUiHandlers() {
     dropEl.addEventListener('drop', (event) => {
       event.preventDefault();
       dropEl.classList.remove('drag');
-      if (event.dataTransfer?.files) {
-        handleFiles(event.dataTransfer.files);
+      const transfer = event.dataTransfer;
+      if (transfer && transfer.files) {
+        handleFiles(transfer.files);
       }
     });
   }
@@ -75,7 +76,9 @@ async function handleFiles(fileList) {
     let viewport = null;
 
     try {
-      loading?.classList.add('show');
+      if (loading) {
+        loading.classList.add('show');
+      }
       if (lower.endsWith('.stl')) {
         viewport = viewerManager.createViewport(name);
         await loadStl(file, card, viewport);
@@ -93,7 +96,9 @@ async function handleFiles(fileList) {
       }
     } finally {
       card.classList.remove('pending');
-      loading?.classList.remove('show');
+      if (loading) {
+        loading.classList.remove('show');
+      }
     }
   }
 }
@@ -119,13 +124,16 @@ async function loadStl(file, card, viewport) {
   const group = new THREE.Group();
   group.add(mesh);
 
-  const positions = geometry.getAttribute('position')?.array;
+  const positionAttr = geometry.getAttribute('position');
+  const positions = positionAttr && positionAttr.array;
   if (!positions) {
     throw new Error('STL geometry missing vertex positions.');
   }
 
-  const unit = stlUnitEl?.value || 'mm';
-  const toMillimeter = unitToMillimeter[unit] ?? 1;
+  const unit = (stlUnitEl && stlUnitEl.value) || 'mm';
+  const toMillimeter = Object.prototype.hasOwnProperty.call(unitToMillimeter, unit)
+    ? unitToMillimeter[unit]
+    : 1;
 
   mesh.scale.setScalar(toMillimeter);
 
@@ -137,13 +145,14 @@ async function loadStl(file, card, viewport) {
   const analysis = analyzeModel(group);
 
   const name = `${file.name}`;
-  const decimals = parseInt(precisionEl?.value ?? '3', 10) || 3;
+  const precisionValue = precisionEl && precisionEl.value !== undefined ? precisionEl.value : '3';
+  const decimals = parseInt(precisionValue, 10) || 3;
   const bodyHtml = [
     `<div class="ok">Loaded STL (${unit} → mm).</div>`,
     formatDims(dims, decimals),
     formatAnalysis(analysis, decimals),
   ].join('');
-  const targetCard = card ?? addCard(name, bodyHtml);
+  const targetCard = card || addCard(name, bodyHtml);
   updateCardBody(targetCard, bodyHtml);
   targetCard.classList.remove('pending');
 
@@ -180,10 +189,12 @@ async function loadStep(file, card, viewport) {
   const group = new THREE.Group();
   let bounds = null;
   for (const meshResult of result.meshes) {
-    const posSrc = meshResult?.attributes?.position?.array
-      ?? meshResult.position
-      ?? meshResult.positions
-      ?? meshResult.vertices;
+    const attr = meshResult && meshResult.attributes;
+    const positionAttr = attr && attr.position;
+    const posSrc = (positionAttr && positionAttr.array)
+      || meshResult.position
+      || meshResult.positions
+      || meshResult.vertices;
     if (!posSrc) continue;
 
     const posArray = posSrc.BYTES_PER_ELEMENT ? posSrc : new Float32Array(posSrc);
@@ -191,7 +202,8 @@ async function loadStep(file, card, viewport) {
     const geometry = new THREE.BufferGeometry();
     geometry.setAttribute('position', new THREE.Float32BufferAttribute(posArray, 3));
 
-    const idxSrc = meshResult.index?.array ?? meshResult.indices ?? meshResult.index;
+    const indexAttr = meshResult.index && meshResult.index.array ? meshResult.index.array : null;
+    const idxSrc = indexAttr || meshResult.indices || meshResult.index;
     if (idxSrc) {
       const indexArray = idxSrc.length > 65535 ? new Uint32Array(idxSrc) : new Uint16Array(idxSrc);
       geometry.setIndex(new THREE.BufferAttribute(indexArray, 1));
@@ -221,13 +233,14 @@ async function loadStep(file, card, viewport) {
   const analysis = analyzeModel(group);
 
   const name = `${file.name}`;
-  const decimals = parseInt(precisionEl?.value ?? '3', 10) || 3;
+  const precisionValue = precisionEl && precisionEl.value !== undefined ? precisionEl.value : '3';
+  const decimals = parseInt(precisionValue, 10) || 3;
   const bodyHtml = [
     '<div class="ok">Loaded STEP (converted → mm).</div>',
     formatDims(dimsMm, decimals),
     formatAnalysis(analysis, decimals),
   ].join('');
-  const targetCard = card ?? addCard(name, bodyHtml);
+  const targetCard = card || addCard(name, bodyHtml);
   updateCardBody(targetCard, bodyHtml);
   targetCard.classList.remove('pending');
 
@@ -331,7 +344,7 @@ function analyzeModel(group) {
 
   const perMesh = [];
   group.traverse((child) => {
-    if (child?.isMesh && child.geometry) {
+    if (child && child.isMesh && child.geometry) {
       const result = analyzeGeometry(child.geometry, child.matrixWorld);
       if (result) {
         perMesh.push(result);
@@ -372,7 +385,7 @@ function analyzeGeometry(geometry, matrixWorld) {
   }
 
   const indexAttr = geometry.getIndex();
-  const matrix = matrixWorld ?? new THREE.Matrix4();
+  const matrix = matrixWorld || new THREE.Matrix4();
 
   const uniqueVertices = [];
   const vertexMap = new Map();
@@ -721,9 +734,18 @@ function summarizeLoop(loop, vertices) {
       { axis: 'z', value: extent.z },
     ].sort((a, b) => a.value - b.value);
     if (axes.length) {
-      const nextValue = axes[1]?.value ?? axes[0].value ?? 0;
-      if (axes[0].value <= LOOP_AXIS_IGNORE_TOLERANCE || axes[0].value <= nextValue * 0.2) {
-        axisToIgnore = axes[0].axis;
+      const secondAxis = axes[1];
+      const firstAxis = axes[0];
+      let nextValue = 0;
+      if (secondAxis && secondAxis.value !== undefined) {
+        nextValue = secondAxis.value;
+      } else if (firstAxis && firstAxis.value !== undefined) {
+        nextValue = firstAxis.value;
+      }
+      if (firstAxis && firstAxis.value !== undefined) {
+        if (firstAxis.value <= LOOP_AXIS_IGNORE_TOLERANCE || firstAxis.value <= nextValue * 0.2) {
+          axisToIgnore = firstAxis.axis;
+        }
       }
     }
   }
@@ -776,7 +798,9 @@ function dedupeClosedLoops(loopSummaries) {
     existing.approxDiameterMm = Number.isFinite(existing.approxDiameterMm) && Number.isFinite(approxDiameterMm)
       ? (existing.approxDiameterMm + approxDiameterMm) / 2
       : existing.approxDiameterMm;
-    existing.vertexCount = Math.max(existing.vertexCount ?? 0, vertexCount ?? 0);
+    const existingCount = existing.vertexCount != null ? existing.vertexCount : 0;
+    const newCount = vertexCount != null ? vertexCount : 0;
+    existing.vertexCount = Math.max(existingCount, newCount);
     if (!existing.axisToIgnore && axisToIgnore) {
       existing.axisToIgnore = axisToIgnore;
     }
@@ -812,7 +836,8 @@ function summarizeBends(edges, faceNormals) {
         min = min === null ? angleDeg : Math.min(min, angleDeg);
         max = max === null ? angleDeg : Math.max(max, angleDeg);
         const rounded = Math.round(angleDeg);
-        histogram.set(rounded, (histogram.get(rounded) ?? 0) + 1);
+        const previous = histogram.has(rounded) ? histogram.get(rounded) : 0;
+        histogram.set(rounded, previous + 1);
       }
     }
   });
@@ -849,7 +874,8 @@ function mergeAnalyses(meshAnalyses) {
         : Math.max(combined.bend.max, analysis.bend.max);
     }
     analysis.bend.histogram.forEach((count, key) => {
-      combined.bend.histogram.set(key, (combined.bend.histogram.get(key) ?? 0) + count);
+      const existingCount = combined.bend.histogram.has(key) ? combined.bend.histogram.get(key) : 0;
+      combined.bend.histogram.set(key, existingCount + count);
     });
   }
 
@@ -940,9 +966,11 @@ function formatAnalysis(analysis, decimals) {
     let bendSummary = '<div class="metric-sub">No bends detected</div>';
     if (bend.bendCount > 0) {
       const average = bend.sum / bend.bendCount;
+      const minText = bend.min !== null && bend.min !== undefined ? bend.min.toFixed(anglePlaces) : '—';
+      const maxText = bend.max !== null && bend.max !== undefined ? bend.max.toFixed(anglePlaces) : '—';
       bendSummary = `
         <div class="metric-sub">${bend.bendCount} of ${bend.candidateEdges} shared edges</div>
-        <div class="metric-sub">avg ${average.toFixed(anglePlaces)}°, range ${bend.min?.toFixed(anglePlaces) ?? '—'}° – ${bend.max?.toFixed(anglePlaces) ?? '—'}°</div>
+        <div class="metric-sub">avg ${average.toFixed(anglePlaces)}°, range ${minText}° – ${maxText}°</div>
       `;
     }
 
@@ -1002,7 +1030,9 @@ function addCard(name, bodyHtml) {
   body.className = 'card-body';
   body.innerHTML = bodyHtml;
   card.append(title, body);
-  resultsEl?.prepend(card);
+  if (resultsEl) {
+    resultsEl.prepend(card);
+  }
   return card;
 }
 
