@@ -3,13 +3,6 @@ import * as THREE from 'three';
 import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js';
 import { STLLoader } from 'three/examples/jsm/loaders/STLLoader.js';
 
-const scene = new THREE.Scene();
-scene.background = new THREE.Color(0x0b1020);
-
-const renderer = new THREE.WebGLRenderer({ antialias: true });
-const camera = new THREE.PerspectiveCamera(45, 1, 0.1, 5000);
-const controls = new OrbitControls(camera, renderer.domElement);
-
 const viewerEl = document.getElementById('viewer');
 const resultsEl = document.getElementById('results');
 const precisionEl = document.getElementById('precision');
@@ -18,6 +11,7 @@ const dropEl = document.getElementById('drop');
 const fileInput = document.getElementById('fileInput');
 const stlUnitEl = document.getElementById('stlUnit');
 
+const viewerManager = new ViewerManager(viewerEl);
 const models = [];
 
 let occtModulePromise = null;
@@ -34,50 +28,7 @@ initViewer();
 attachUiHandlers();
 
 function initViewer() {
-  renderer.setPixelRatio(window.devicePixelRatio || 1);
-  const initialWidth = viewerEl.clientWidth || viewerEl.offsetWidth || 1;
-  const initialHeight = viewerEl.clientHeight || viewerEl.offsetHeight || 1;
-  renderer.setSize(initialWidth, initialHeight);
-  renderer.outputColorSpace = THREE.SRGBColorSpace;
-  viewerEl.appendChild(renderer.domElement);
-
-  camera.aspect = initialWidth / initialHeight;
-  camera.position.set(180, 120, 180);
-  camera.lookAt(0, 0, 0);
-  camera.updateProjectionMatrix();
-
-  controls.enableDamping = true;
-  controls.dampingFactor = 0.08;
-  controls.target.set(0, 0, 0);
-  controls.update();
-
-  const hemisphere = new THREE.HemisphereLight(0xffffff, 0x1b1f3a, 0.6);
-  scene.add(hemisphere);
-
-  const dir1 = new THREE.DirectionalLight(0xffffff, 0.8);
-  dir1.position.set(1, 1.25, 1.5);
-  scene.add(dir1);
-
-  const dir2 = new THREE.DirectionalLight(0x9fb5ff, 0.5);
-  dir2.position.set(-1.5, -0.8, -1.25);
-  scene.add(dir2);
-
-  window.addEventListener('resize', onWindowResize);
-  animate();
-}
-
-function onWindowResize() {
-  const width = viewerEl.clientWidth || viewerEl.offsetWidth || 1;
-  const height = viewerEl.clientHeight || viewerEl.offsetHeight || 1;
-  renderer.setSize(width, height);
-  camera.aspect = width / height;
-  camera.updateProjectionMatrix();
-}
-
-function animate() {
-  requestAnimationFrame(animate);
-  controls.update();
-  renderer.render(scene, camera);
+  viewerManager.initialize();
 }
 
 function attachUiHandlers() {
@@ -115,20 +66,28 @@ async function handleFiles(fileList) {
   for (const file of fileList) {
     const name = file.name || 'file';
     const lower = name.toLowerCase();
-    const card = addCard(name, '<div class=\"muted small\">Processing…</div>');
+    const card = addCard(name, '<div class="muted small">Processing…</div>');
     card.classList.add('pending');
+
+    let viewport = null;
+
     try {
       loading?.classList.add('show');
       if (lower.endsWith('.stl')) {
-        await loadStl(file, card);
+        viewport = viewerManager.createViewport(name);
+        await loadStl(file, card, viewport);
       } else if (lower.endsWith('.step') || lower.endsWith('.stp')) {
-        await loadStep(file, card);
+        viewport = viewerManager.createViewport(name);
+        await loadStep(file, card, viewport);
       } else {
-        updateCardBody(card, '<div class=\"warn\">Unsupported file type.</div>');
+        updateCardBody(card, '<div class="warn">Unsupported file type.</div>');
       }
     } catch (error) {
       console.error('Failed to process file.', error);
-      updateCardBody(card, `<div class=\"warn\">Failed to load: ${error.message || error}</div>`);
+      updateCardBody(card, `<div class="warn">Failed to load: ${error.message || error}</div>`);
+      if (viewport) {
+        viewerManager.removeViewport(viewport);
+      }
     } finally {
       card.classList.remove('pending');
       loading?.classList.remove('show');
@@ -136,7 +95,11 @@ async function handleFiles(fileList) {
   }
 }
 
-async function loadStl(file, card) {
+async function loadStl(file, card, viewport) {
+  if (!viewport) {
+    throw new Error('A viewer window could not be created for this STL file.');
+  }
+
   const arrayBuffer = await file.arrayBuffer();
   const loader = new STLLoader();
   const geometry = loader.parse(arrayBuffer);
@@ -167,31 +130,30 @@ async function loadStl(file, card) {
   bounds.min.multiplyScalar(toMillimeter);
   bounds.max.multiplyScalar(toMillimeter);
 
-  scene.add(group);
-
   const dims = dimsFromBounds(bounds);
-  const helper = addBoundingBoxHelper(bounds);
 
   const name = `${file.name}`;
   const decimals = parseInt(precisionEl?.value ?? '3', 10) || 3;
-  const bodyHtml = `<div class=\"ok\">Loaded STL (${unit} → mm).</div>${formatDims(dims, decimals)}`;
+  const bodyHtml = `<div class="ok">Loaded STL (${unit} → mm).</div>${formatDims(dims, decimals)}`;
   const targetCard = card ?? addCard(name, bodyHtml);
   updateCardBody(targetCard, bodyHtml);
   targetCard.classList.remove('pending');
-  const model = { name, group, bounds, unit: unit || 'mm', kind: 'stl', helper };
 
-  targetCard.addEventListener('click', () => {
-    activateModel(model);
-  });
+  viewport.setTitle(name);
+  viewport.setModel(group, bounds.clone());
 
+  const model = { name, group, bounds: bounds.clone(), unit: unit || 'mm', kind: 'stl', viewport, card: targetCard };
+  targetCard.addEventListener('click', () => viewport.focus());
   models.push(model);
-  activateModel(model);
   return targetCard;
 }
 
-async function loadStep(file, card) {
+async function loadStep(file, card, viewport) {
   if (!file) {
     throw new Error('A file must be provided to loadStep.');
+  }
+  if (!viewport) {
+    throw new Error('A viewer window could not be created for this STEP file.');
   }
 
   const occt = await ensureOcctModule();
@@ -240,31 +202,28 @@ async function loadStep(file, card) {
     group.add(mesh);
 
     const meshBounds = computeBoundsFromPositions(posArray);
-    bounds = bounds ? bounds.union(meshBounds) : meshBounds;
+    bounds = bounds ? bounds.union(meshBounds) : meshBounds.clone();
   }
 
   if (!bounds) {
     throw new Error('No geometry produced from STEP.');
   }
 
-  scene.add(group);
   const dimsMm = dimsFromBounds(bounds);
-  const helper = addBoundingBoxHelper(bounds);
 
   const name = `${file.name}`;
   const decimals = parseInt(precisionEl?.value ?? '3', 10) || 3;
-  const bodyHtml = `<div class=\"ok\">Loaded STEP (converted → mm).</div>${formatDims(dimsMm, decimals)}`;
+  const bodyHtml = `<div class="ok">Loaded STEP (converted → mm).</div>${formatDims(dimsMm, decimals)}`;
   const targetCard = card ?? addCard(name, bodyHtml);
   updateCardBody(targetCard, bodyHtml);
   targetCard.classList.remove('pending');
-  const model = { name, group, bounds, unit: 'mm', kind: 'step', helper };
 
-  targetCard.addEventListener('click', () => {
-    activateModel(model);
-  });
+  viewport.setTitle(name);
+  viewport.setModel(group, bounds.clone());
 
+  const model = { name, group, bounds: bounds.clone(), unit: 'mm', kind: 'step', viewport, card: targetCard };
+  targetCard.addEventListener('click', () => viewport.focus());
   models.push(model);
-  activateModel(model);
   return targetCard;
 }
 
@@ -331,17 +290,6 @@ async function ensureOcctModule() {
   return occtModulePromise;
 }
 
-function activateModel(model) {
-  models.forEach((m) => {
-    if (m.helper) {
-      m.helper.material.opacity = m === model ? 0.9 : 0.25;
-      m.helper.material.transparent = true;
-      m.helper.visible = true;
-    }
-  });
-  centerAndFrame(model.bounds);
-}
-
 function computeBoundsFromPositions(positions) {
   const bounds = new THREE.Box3();
   const temp = new THREE.Vector3();
@@ -361,37 +309,22 @@ function dimsFromBounds(bounds) {
   };
 }
 
-function addBoundingBoxHelper(bounds) {
+function createBoundingBoxHelper(bounds) {
   const size = new THREE.Vector3();
   bounds.getSize(size);
   const center = new THREE.Vector3();
   bounds.getCenter(center);
 
-  const geometry = new THREE.BoxGeometry(size.x, size.y, size.z);
+  const geometry = new THREE.BoxGeometry(
+    Math.max(size.x, 1e-6),
+    Math.max(size.y, 1e-6),
+    Math.max(size.z, 1e-6),
+  );
   const edges = new THREE.EdgesGeometry(geometry);
-  const material = new THREE.LineBasicMaterial({ color: 0x7aa2ff, transparent: true, opacity: 0.25 });
+  const material = new THREE.LineBasicMaterial({ color: 0x7aa2ff, transparent: true, opacity: 0.3 });
   const helper = new THREE.LineSegments(edges, material);
   helper.position.copy(center);
-  scene.add(helper);
   return helper;
-}
-
-function centerAndFrame(bounds) {
-  const center = new THREE.Vector3();
-  const size = new THREE.Vector3();
-  bounds.getCenter(center);
-  bounds.getSize(size);
-
-  const maxDim = Math.max(size.x, size.y, size.z);
-  const radius = maxDim * 1.35 + 1;
-  const offset = new THREE.Vector3(1.2, 0.9, 1.1).normalize().multiplyScalar(radius);
-
-  controls.target.copy(center);
-  camera.position.copy(center).add(offset);
-  camera.near = Math.max(radius / 100, 0.1);
-  camera.far = radius * 20 + radius;
-  camera.updateProjectionMatrix();
-  controls.update();
 }
 
 function formatDims(dims, decimals) {
@@ -400,7 +333,7 @@ function formatDims(dims, decimals) {
   const places = Number.isFinite(decimals) ? Math.max(decimals, 0) : 3;
   const mmText = `${mm.x.toFixed(places)} × ${mm.y.toFixed(places)} × ${mm.z.toFixed(places)} mm`;
   const inchText = `${inch.x.toFixed(places)} × ${inch.y.toFixed(places)} × ${inch.z.toFixed(places)} in`;
-  return `<div class=\"dim\">${mmText}<br><small>${inchText}</small></div>`;
+  return `<div class="dim">${mmText}<br><small>${inchText}</small></div>`;
 }
 
 function addCard(name, bodyHtml) {
@@ -424,8 +357,207 @@ function updateCardBody(card, bodyHtml) {
   }
 }
 
+class ViewerManager {
+  constructor(container) {
+    this.container = container;
+    this.viewports = new Set();
+    this.handleResize = this.handleResize.bind(this);
+
+    if (this.container) {
+      const existingHint = this.container.querySelector('.viewer-empty');
+      if (existingHint) {
+        this.emptyHint = existingHint;
+      } else {
+        this.emptyHint = this.createEmptyHint();
+        this.container.appendChild(this.emptyHint);
+      }
+    }
+
+    window.addEventListener('resize', this.handleResize);
+  }
+
+  initialize() {
+    this.updateEmptyState();
+    this.handleResize();
+  }
+
+  createEmptyHint() {
+    const hint = document.createElement('div');
+    hint.className = 'viewer-empty';
+    hint.textContent = 'Load a file to open it in its own window.';
+    return hint;
+  }
+
+  createViewport(title) {
+    if (!this.container) {
+      throw new Error('Viewer container missing.');
+    }
+    const viewport = new ModelViewport(this.container, title);
+    this.viewports.add(viewport);
+    this.updateEmptyState();
+    viewport.handleResize();
+    return viewport;
+  }
+
+  removeViewport(viewport) {
+    if (!viewport || !this.viewports.has(viewport)) {
+      return;
+    }
+    this.viewports.delete(viewport);
+    viewport.dispose();
+    this.updateEmptyState();
+  }
+
+  updateEmptyState() {
+    if (!this.emptyHint) {
+      return;
+    }
+    this.emptyHint.style.display = this.viewports.size ? 'none' : 'flex';
+  }
+
+  handleResize() {
+    this.viewports.forEach((viewport) => viewport.handleResize());
+  }
+}
+
+class ModelViewport {
+  constructor(parent, title) {
+    this.parent = parent;
+    this.root = document.createElement('section');
+    this.root.className = 'viewer-window';
+    this.titleEl = document.createElement('div');
+    this.titleEl.className = 'viewer-window-title';
+    this.titleEl.textContent = title;
+    this.canvasHost = document.createElement('div');
+    this.canvasHost.className = 'viewer-canvas';
+    this.root.append(this.titleEl, this.canvasHost);
+    parent.appendChild(this.root);
+
+    this.renderer = new THREE.WebGLRenderer({ antialias: true });
+    this.renderer.setPixelRatio(window.devicePixelRatio || 1);
+    this.renderer.outputColorSpace = THREE.SRGBColorSpace;
+    this.canvasHost.appendChild(this.renderer.domElement);
+
+    this.scene = new THREE.Scene();
+    this.scene.background = new THREE.Color(0x0b1020);
+
+    this.camera = new THREE.PerspectiveCamera(45, 1, 0.1, 5000);
+    this.controls = new OrbitControls(this.camera, this.renderer.domElement);
+    this.controls.enableDamping = true;
+    this.controls.dampingFactor = 0.08;
+
+    const hemisphere = new THREE.HemisphereLight(0xffffff, 0x1b1f3a, 0.6);
+    this.scene.add(hemisphere);
+
+    const dir1 = new THREE.DirectionalLight(0xffffff, 0.8);
+    dir1.position.set(1, 1.25, 1.5);
+    this.scene.add(dir1);
+
+    const dir2 = new THREE.DirectionalLight(0x9fb5ff, 0.5);
+    dir2.position.set(-1.5, -0.8, -1.25);
+    this.scene.add(dir2);
+
+    this.animate = this.animate.bind(this);
+    this.animationId = requestAnimationFrame(this.animate);
+  }
+
+  setTitle(name) {
+    this.titleEl.textContent = name;
+  }
+
+  setModel(group, bounds) {
+    if (this.currentGroup) {
+      this.scene.remove(this.currentGroup);
+    }
+    if (this.helper) {
+      if (this.helper.geometry) {
+        this.helper.geometry.dispose();
+      }
+      if (this.helper.material) {
+        this.helper.material.dispose();
+      }
+      this.scene.remove(this.helper);
+      this.helper = null;
+    }
+
+    this.currentGroup = group;
+    this.scene.add(group);
+    this.bounds = bounds.clone();
+    this.helper = createBoundingBoxHelper(this.bounds);
+    this.scene.add(this.helper);
+    this.frame(this.bounds);
+    this.handleResize();
+  }
+
+  frame(bounds) {
+    const center = new THREE.Vector3();
+    const size = new THREE.Vector3();
+    bounds.getCenter(center);
+    bounds.getSize(size);
+
+    const maxDim = Math.max(size.x, size.y, size.z);
+    const radius = maxDim * 1.35 + 1;
+    const offset = new THREE.Vector3(1.2, 0.9, 1.1).normalize().multiplyScalar(radius);
+
+    this.controls.target.copy(center);
+    this.camera.position.copy(center).add(offset);
+    this.camera.near = Math.max(radius / 100, 0.1);
+    this.camera.far = radius * 20 + radius;
+    this.camera.updateProjectionMatrix();
+    this.controls.update();
+  }
+
+  handleResize() {
+    if (!this.renderer || !this.canvasHost) {
+      return;
+    }
+    const width = Math.max(this.canvasHost.clientWidth || this.canvasHost.offsetWidth || 0, 1);
+    const height = Math.max(this.canvasHost.clientHeight || this.canvasHost.offsetHeight || Math.round(width * 0.75), 1);
+    this.renderer.setSize(width, height);
+    this.camera.aspect = width / height;
+    this.camera.updateProjectionMatrix();
+  }
+
+  animate() {
+    this.controls.update();
+    this.renderer.render(this.scene, this.camera);
+    if (!this.disposed) {
+      this.animationId = requestAnimationFrame(this.animate);
+    }
+  }
+
+  focus() {
+    this.root.scrollIntoView({ behavior: 'smooth', block: 'center' });
+    this.root.classList.add('viewer-window--active');
+    window.setTimeout(() => {
+      this.root.classList.remove('viewer-window--active');
+    }, 600);
+  }
+
+  dispose() {
+    this.disposed = true;
+    if (this.animationId) {
+      cancelAnimationFrame(this.animationId);
+    }
+    this.controls.dispose();
+    this.renderer.dispose();
+    if (this.currentGroup) {
+      this.scene.remove(this.currentGroup);
+      this.currentGroup = null;
+    }
+    if (this.helper) {
+      if (this.helper.geometry) {
+        this.helper.geometry.dispose();
+      }
+      if (this.helper.material) {
+        this.helper.material.dispose();
+      }
+    }
+    this.root.remove();
+  }
+}
+
 export {
-  scene,
   models,
   precisionEl,
   loading,
