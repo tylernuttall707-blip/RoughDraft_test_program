@@ -10,6 +10,7 @@ A static, browser‑only tool that loads **STL** and **STEP (.stp/.step)** files
 - STL unit selector (STL has no intrinsic units)
 - STEP parsing fully in the browser via OpenCascade (WASM)
 - Dimensions in **mm** and **inches** with configurable decimals
+- Mesh analysis for sheet-metal style parts: outer edge perimeter, hole counts/diameters, and bend angle statistics
 
 
 ## File structure
