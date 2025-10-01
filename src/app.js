@@ -437,8 +437,21 @@ function analyzeModel(group) {
 
   const perMesh = [];
   group.traverse((child) => {
-    if (child && child.isMesh && child.geometry) {
+    if (!child || !child.geometry) {
+      return;
+    }
+
+    if (child.isMesh) {
       const result = analyzeGeometry(child.geometry, child.matrixWorld);
+      if (result) {
+        perMesh.push(result);
+      }
+      return;
+    }
+
+    if (child.isLine) {
+      const isClosed = child.type === 'LineLoop';
+      const result = analyzeLineGeometry(child.geometry, child.matrixWorld, isClosed);
       if (result) {
         perMesh.push(result);
       }
@@ -452,6 +465,18 @@ function analyzeModel(group) {
   return mergeAnalyses(perMesh);
 }
 
+function createEmptyBendStats() {
+  return {
+    totalEdges: 0,
+    candidateEdges: 0,
+    bendCount: 0,
+    sum: 0,
+    min: null,
+    max: null,
+    histogram: new Map(),
+  };
+}
+
 function createEmptyAnalysis() {
   return {
     loops: [],
@@ -461,15 +486,7 @@ function createEmptyAnalysis() {
     totalBoundaryMm: 0,
     circularHoleCount: 0,
     nonCircularHoleCount: 0,
-    bend: {
-      totalEdges: 0,
-      candidateEdges: 0,
-      bendCount: 0,
-      sum: 0,
-      min: null,
-      max: null,
-      histogram: new Map(),
-    },
+    bend: createEmptyBendStats(),
   };
 }
 
@@ -775,6 +792,63 @@ function analyzeGeometry(geometry, matrixWorld) {
     loops: uniqueLoopSummaries,
     totalBoundaryMm,
     bend: bendStats,
+  };
+}
+
+function analyzeLineGeometry(geometry, matrixWorld, isClosedHint = false) {
+  const positionAttr = geometry.getAttribute('position');
+  if (!positionAttr) {
+    return null;
+  }
+
+  const matrix = matrixWorld || new THREE.Matrix4();
+  const points = [];
+  const temp = new THREE.Vector3();
+  for (let i = 0; i < positionAttr.count; i += 1) {
+    temp.set(positionAttr.getX(i), positionAttr.getY(i), positionAttr.getZ(i));
+    temp.applyMatrix4(matrix);
+    points.push(temp.clone());
+  }
+
+  if (points.length < 2) {
+    return null;
+  }
+
+  let closed = Boolean(isClosedHint);
+  const first = points[0];
+  const last = points[points.length - 1];
+  const closureTolerance = VERTEX_MERGE_TOLERANCE * 10;
+  if (!closed && points.length > 2 && first.distanceTo(last) <= closureTolerance) {
+    closed = true;
+  }
+
+  if (closed && points.length > 1 && first.distanceTo(last) <= closureTolerance) {
+    points.pop();
+  }
+
+  if (closed && points.length < 3) {
+    return null;
+  }
+
+  const vertices = points.map((point) => point.clone());
+  const indices = vertices.map((_, index) => index);
+  if (closed) {
+    indices.push(0);
+  }
+
+  const loop = { vertices: indices, closed };
+  const summary = summarizeLoop(loop, vertices);
+  if (!summary) {
+    return null;
+  }
+
+  const deduped = dedupeClosedLoops([summary]);
+  const totalBoundaryMm = deduped.reduce((sum, entry) => sum + entry.lengthMm, 0);
+
+  return {
+    loops: deduped,
+    totalBoundaryMm,
+    bend: createEmptyBendStats(),
   };
 }
 
