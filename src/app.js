@@ -25,14 +25,10 @@ const unitToMillimeter = {
   ft: 304.8,
 };
 
-const PLANAR_ANGLE_THRESHOLD_DEG = 5;
-const LOOP_AXIS_IGNORE_TOLERANCE = 1e-3;
+const PLANAR_ANGLE_THRESHOLD_DEG = 3;
+const CIRCULARITY_THRESHOLD = 0.80;
 const VERTEX_MERGE_TOLERANCE = 1e-5;
-const BEND_MIN_ANGLE_DEG = 5;
-const COMMON_BEND_ANGLES = [30, 45, 60, 75, 90, 120, 135];
-const BEND_HIGHLIGHT_TOLERANCE_DEG = 1.5;
-const CIRCULARITY_CLASS_THRESHOLD = 0.8;
-const MM_TO_INCH = 0.0393700787;
+const BEND_ANGLE_TOLERANCE_DEG = 3;
 
 function initViewer() {
   if (!viewerManager) {
@@ -152,7 +148,7 @@ async function loadStl(file, card, viewport) {
   bounds.max.multiplyScalar(toMillimeter);
 
   const dims = dimsFromBounds(bounds);
-  const analysis = analyzeModel(group);
+  const analysis = analyzeSheetMetal(group);
 
   const name = `${file.name}`;
   const precisionValue = precisionEl && precisionEl.value !== undefined ? precisionEl.value : '3';
@@ -160,7 +156,7 @@ async function loadStl(file, card, viewport) {
   const bodyHtml = [
     `<div class="ok">Loaded STL (${unit} → mm).</div>`,
     formatDims(dims, decimals),
-    formatAnalysis(analysis, decimals),
+    formatLaserCutAnalysis(analysis, decimals),
   ].join('');
   const targetCard = card || addCard(name, bodyHtml);
   updateCardBody(targetCard, bodyHtml);
@@ -197,15 +193,15 @@ async function loadDxf(file, card, viewport) {
   }
 
   const dimsMm = dimsFromBounds(bounds);
-  const analysis = analyzeModel(group);
+  const analysis = analyzeSheetMetal(group);
 
   const name = `${file.name}`;
   const precisionValue = precisionEl && precisionEl.value !== undefined ? precisionEl.value : '3';
   const decimals = parseInt(precisionValue, 10) || 3;
   const bodyHtml = [
-    '<div class="ok">Loaded DXF (units assumed millimeter).</div>',
+    '<div class="ok">Loaded DXF (flat pattern, units assumed mm).</div>',
     formatDims(dimsMm, decimals),
-    formatAnalysis(analysis, decimals),
+    formatLaserCutAnalysis(analysis, decimals),
   ].join('');
   const targetCard = card || addCard(name, bodyHtml);
   updateCardBody(targetCard, bodyHtml);
@@ -233,8 +229,8 @@ async function loadStep(file, card, viewport) {
   const params = {
     linearUnit: 'millimeter',
     linearDeflectionType: 'bounding_box_ratio',
-    linearDeflection: 0.0001,
-    angularDeflection: 0.1,
+    linearDeflection: 0.00005,
+    angularDeflection: 0.05,
   };
   const result = occt.ReadStepFile(uint8, params);
   if (!result || !result.success) {
@@ -285,7 +281,7 @@ async function loadStep(file, card, viewport) {
   }
 
   const dimsMm = dimsFromBounds(bounds);
-  const analysis = analyzeModel(group);
+  const analysis = analyzeSheetMetal(group);
 
   const name = `${file.name}`;
   const precisionValue = precisionEl && precisionEl.value !== undefined ? precisionEl.value : '3';
@@ -293,7 +289,7 @@ async function loadStep(file, card, viewport) {
   const bodyHtml = [
     '<div class="ok">Loaded STEP (converted → mm).</div>',
     formatDims(dimsMm, decimals),
-    formatAnalysis(analysis, decimals),
+    formatLaserCutAnalysis(analysis, decimals),
   ].join('');
   const targetCard = card || addCard(name, bodyHtml);
   updateCardBody(targetCard, bodyHtml);
@@ -428,7 +424,7 @@ function dimsFromBounds(bounds) {
   };
 }
 
-function analyzeModel(group) {
+function analyzeSheetMetal(group) {
   if (!group) {
     return createEmptyAnalysis();
   }
@@ -437,7 +433,7 @@ function analyzeModel(group) {
 
   const perMesh = [];
   group.traverse((child) => {
-    if (!child || !child.geometry) {
+    if (!child || !child.isObject3D || !child.geometry) {
       return;
     }
 
@@ -446,10 +442,7 @@ function analyzeModel(group) {
       if (result) {
         perMesh.push(result);
       }
-      return;
-    }
-
-    if (child.isLine) {
+    } else if (child.isLine) {
       const isClosed = child.type === 'LineLoop';
       const result = analyzeLineGeometry(child.geometry, child.matrixWorld, isClosed);
       if (result) {
@@ -483,10 +476,14 @@ function createEmptyAnalysis() {
     holes: [],
     openLoops: [],
     outerPerimeterMm: null,
-    totalBoundaryMm: 0,
-    circularHoleCount: 0,
-    nonCircularHoleCount: 0,
+    totalCutLengthMm: 0,
     bend: createEmptyBendStats(),
+    flatPattern: {
+      isLikelyFlat: false,
+      dominantPlane: null,
+      largestPatchRatio: null,
+      aspectRatio: null,
+    },
   };
 }
 
@@ -784,14 +781,52 @@ function analyzeGeometry(geometry, matrixWorld) {
 
   const loopSummaries = loops.map((loop) => summarizeLoop(loop, uniqueVertices));
   const uniqueLoopSummaries = dedupeClosedLoops(loopSummaries);
-  const totalBoundaryMm = uniqueLoopSummaries.reduce((sum, entry) => sum + entry.lengthMm, 0);
+  const totalCutLengthMm = uniqueLoopSummaries.reduce((sum, entry) => sum + entry.lengthMm, 0);
 
   const bendStats = summarizeBends(edges, faceNormals);
 
+  const flatPattern = analyzeFlatPattern(patches, boundsSize);
+
   return {
     loops: uniqueLoopSummaries,
-    totalBoundaryMm,
+    totalCutLengthMm,
     bend: bendStats,
+    flatPattern,
+  };
+}
+
+function analyzeFlatPattern(patches, boundsSize) {
+  if (!patches.length) {
+    return { isLikelyFlat: false, dominantPlane: null };
+  }
+
+  const largestPatch = patches.reduce((max, patch) =>
+    patch.faces.length > max.faces.length ? patch : max
+  , patches[0]);
+
+  const totalFaces = patches.reduce((sum, p) => sum + p.faces.length, 0);
+  const largestPatchRatio = largestPatch.faces.length / totalFaces;
+
+  const smallestDim = Math.min(boundsSize.x, boundsSize.y, boundsSize.z);
+  const largestDim = Math.max(boundsSize.x, boundsSize.y, boundsSize.z);
+  const aspectRatio = largestDim / (smallestDim || 1);
+
+  const isLikelyFlat = largestPatchRatio > 0.6 && aspectRatio > 5;
+
+  let dominantAxis = null;
+  if (isLikelyFlat) {
+    const normal = largestPatch.normal;
+    const absNormal = new THREE.Vector3(Math.abs(normal.x), Math.abs(normal.y), Math.abs(normal.z));
+    if (absNormal.x > absNormal.y && absNormal.x > absNormal.z) dominantAxis = 'X';
+    else if (absNormal.y > absNormal.x && absNormal.y > absNormal.z) dominantAxis = 'Y';
+    else dominantAxis = 'Z';
+  }
+
+  return {
+    isLikelyFlat,
+    dominantPlane: dominantAxis,
+    largestPatchRatio,
+    aspectRatio,
   };
 }
 
@@ -843,12 +878,18 @@ function analyzeLineGeometry(geometry, matrixWorld, isClosedHint = false) {
   }
 
   const deduped = dedupeClosedLoops([summary]);
-  const totalBoundaryMm = deduped.reduce((sum, entry) => sum + entry.lengthMm, 0);
+  const totalCutLengthMm = deduped.reduce((sum, entry) => sum + entry.lengthMm, 0);
 
   return {
     loops: deduped,
-    totalBoundaryMm,
+    totalCutLengthMm,
     bend: createEmptyBendStats(),
+    flatPattern: {
+      isLikelyFlat: true,
+      dominantPlane: 'Z',
+      largestPatchRatio: 1,
+      aspectRatio: 0,
+    },
   };
 }
 
@@ -858,8 +899,6 @@ function summarizeLoop(loop, vertices) {
   let length = 0;
   const boundsMin = new THREE.Vector3(Infinity, Infinity, Infinity);
   const boundsMax = new THREE.Vector3(-Infinity, -Infinity, -Infinity);
-  const validPoints = [];
-
   for (let i = 0; i < ordered.length - 1; i += 1) {
     const start = vertices[ordered[i]];
     const end = vertices[ordered[i + 1]];
@@ -869,12 +908,13 @@ function summarizeLoop(loop, vertices) {
   }
 
   let maxDistSq = 0;
+  let centroid = new THREE.Vector3();
   for (let i = 0; i < points.length; i += 1) {
     const a = vertices[points[i]];
     if (!a) continue;
-    validPoints.push(a);
     boundsMin.min(a);
     boundsMax.max(a);
+    centroid.add(a);
     for (let j = i + 1; j < points.length; j += 1) {
       const b = vertices[points[j]];
       if (!b) continue;
@@ -885,88 +925,47 @@ function summarizeLoop(loop, vertices) {
     }
   }
 
-  const maxChordDiameter = Math.sqrt(Math.max(maxDistSq, 0));
-
-  let centroid = null;
-  let axisToIgnore = null;
-  let averageRadius = null;
-  let radiusStdDev = null;
-  let perimeterRadius = null;
-  let circularity = null;
-
-  if (loop.closed && validPoints.length) {
-    centroid = new THREE.Vector3();
-    validPoints.forEach((vertex) => centroid.add(vertex));
-    centroid.multiplyScalar(1 / validPoints.length);
-
-    const extent = new THREE.Vector3().subVectors(boundsMax, boundsMin);
-    const axes = [
-      { axis: 'x', value: extent.x },
-      { axis: 'y', value: extent.y },
-      { axis: 'z', value: extent.z },
-    ].sort((a, b) => a.value - b.value);
-    if (axes.length) {
-      const secondAxis = axes[1];
-      const firstAxis = axes[0];
-      let nextValue = 0;
-      if (secondAxis && secondAxis.value !== undefined) {
-        nextValue = secondAxis.value;
-      } else if (firstAxis && firstAxis.value !== undefined) {
-        nextValue = firstAxis.value;
-      }
-      if (firstAxis && firstAxis.value !== undefined) {
-        if (firstAxis.value <= LOOP_AXIS_IGNORE_TOLERANCE || firstAxis.value <= nextValue * 0.2) {
-          axisToIgnore = firstAxis.axis;
-        }
-      }
-    }
-
-    let radiusSum = 0;
-    let radiusSqSum = 0;
-    validPoints.forEach((vertex) => {
-      const radius = vertex.distanceTo(centroid);
-      radiusSum += radius;
-      radiusSqSum += radius * radius;
-    });
-
-    averageRadius = radiusSum / validPoints.length;
-    const variance = Math.max(radiusSqSum / validPoints.length - averageRadius * averageRadius, 0);
-    radiusStdDev = Math.sqrt(variance);
-    perimeterRadius = length > 0 ? length / (2 * Math.PI) : 0;
-
-    if (averageRadius > 0) {
-      const normalizedStd = radiusStdDev / averageRadius;
-      const varianceScore = THREE.MathUtils.clamp(1 - normalizedStd, 0, 1);
-      let perimeterScore = 0;
-      if (perimeterRadius > 0) {
-        const minRadius = Math.min(averageRadius, perimeterRadius);
-        const maxRadius = Math.max(averageRadius, perimeterRadius);
-        perimeterScore = maxRadius > 0 ? minRadius / maxRadius : 0;
-      }
-      circularity = THREE.MathUtils.clamp((varianceScore * 0.6) + (perimeterScore * 0.4), 0, 1);
-    } else {
-      circularity = 0;
-    }
-
-    if (!Number.isFinite(averageRadius) || averageRadius === 0) {
-      averageRadius = null;
-      radiusStdDev = null;
-      perimeterRadius = null;
-    } else if (!(perimeterRadius > 0)) {
-      perimeterRadius = null;
-    }
+  const approxDiameterMm = Math.sqrt(Math.max(maxDistSq, 0));
+  if (points.length) {
+    centroid.multiplyScalar(1 / points.length);
   }
 
-  let approxDiameterMm = maxChordDiameter;
-  if (loop.closed && averageRadius) {
-    const avgDiameter = averageRadius * 2;
-    const perimeterDiameter = perimeterRadius ? perimeterRadius * 2 : avgDiameter;
-    const combinedDiameter = (avgDiameter + perimeterDiameter) / 2;
-    const lerpFactor = circularity !== null ? THREE.MathUtils.clamp(circularity, 0, 1) : 0;
-    if (combinedDiameter > 0 && maxChordDiameter > 0) {
-      approxDiameterMm = THREE.MathUtils.lerp(maxChordDiameter, combinedDiameter, lerpFactor);
-    } else if (combinedDiameter > 0) {
-      approxDiameterMm = combinedDiameter;
+  let circularity = 0;
+
+  if (loop.closed && points.length >= 4) {
+    const perimeterBasedRadius = length / (2 * Math.PI);
+    let avgDistanceFromCentroid = 0;
+    let validPoints = 0;
+
+    for (const index of points) {
+      const vertex = vertices[index];
+      if (vertex) {
+        avgDistanceFromCentroid += vertex.distanceTo(centroid);
+        validPoints++;
+      }
+    }
+
+    if (validPoints > 0) {
+      avgDistanceFromCentroid /= validPoints;
+
+      let distanceVariance = 0;
+      for (const index of points) {
+        const vertex = vertices[index];
+        if (vertex) {
+          const dist = vertex.distanceTo(centroid);
+          distanceVariance += Math.pow(dist - avgDistanceFromCentroid, 2);
+        }
+      }
+      distanceVariance /= validPoints;
+      const stdDev = Math.sqrt(distanceVariance);
+
+      const coefficientOfVariation = avgDistanceFromCentroid > 0 ? stdDev / avgDistanceFromCentroid : 1;
+      circularity = Math.max(0, 1 - coefficientOfVariation * 5);
+
+      const radiusRatio = avgDistanceFromCentroid > 0
+        ? Math.min(perimeterBasedRadius, avgDistanceFromCentroid) / Math.max(perimeterBasedRadius, avgDistanceFromCentroid)
+        : 0;
+      circularity = (circularity + radiusRatio) / 2;
     }
   }
 
@@ -975,12 +974,8 @@ function summarizeLoop(loop, vertices) {
     lengthMm: length,
     approxDiameterMm,
     vertexCount: points.length,
-    centroid,
-    axisToIgnore,
+    centroid: loop.closed ? centroid : null,
     circularity,
-    averageRadiusMm: averageRadius,
-    radiusStdDevMm: radiusStdDev,
-    perimeterRadiusMm: perimeterRadius,
   };
 }
 
@@ -1000,21 +995,11 @@ function dedupeClosedLoops(loopSummaries) {
       continue;
     }
 
-    const {
-      centroid,
-      lengthMm,
-      vertexCount,
-      approxDiameterMm,
-      axisToIgnore,
-      circularity,
-      averageRadiusMm,
-      radiusStdDevMm,
-      perimeterRadiusMm,
-    } = summary;
+    const { centroid, lengthMm, vertexCount, approxDiameterMm } = summary;
     const centroidKey = [
-      axisToIgnore === 'x' ? '_' : quantize(centroid.x),
-      axisToIgnore === 'y' ? '_' : quantize(centroid.y),
-      axisToIgnore === 'z' ? '_' : quantize(centroid.z),
+      quantize(centroid.x),
+      quantize(centroid.y),
+      quantize(centroid.z),
     ].join('|');
     const diameterKey = Number.isFinite(approxDiameterMm) ? quantize(approxDiameterMm) : 'nan';
     const key = `${centroidKey}|${quantize(lengthMm)}|${vertexCount}|${diameterKey}`;
@@ -1035,37 +1020,7 @@ function dedupeClosedLoops(loopSummaries) {
     const existingCount = existing.vertexCount != null ? existing.vertexCount : 0;
     const newCount = vertexCount != null ? vertexCount : 0;
     existing.vertexCount = Math.max(existingCount, newCount);
-    if (!existing.axisToIgnore && axisToIgnore) {
-      existing.axisToIgnore = axisToIgnore;
-    }
-    if (circularity !== null && circularity !== undefined) {
-      if (existing.circularity === null || existing.circularity === undefined) {
-        existing.circularity = circularity;
-      } else {
-        existing.circularity = (existing.circularity + circularity) / 2;
-      }
-    }
-    if (Number.isFinite(averageRadiusMm)) {
-      if (Number.isFinite(existing.averageRadiusMm)) {
-        existing.averageRadiusMm = (existing.averageRadiusMm + averageRadiusMm) / 2;
-      } else {
-        existing.averageRadiusMm = averageRadiusMm;
-      }
-    }
-    if (Number.isFinite(radiusStdDevMm)) {
-      if (Number.isFinite(existing.radiusStdDevMm)) {
-        existing.radiusStdDevMm = (existing.radiusStdDevMm + radiusStdDevMm) / 2;
-      } else {
-        existing.radiusStdDevMm = radiusStdDevMm;
-      }
-    }
-    if (Number.isFinite(perimeterRadiusMm)) {
-      if (Number.isFinite(existing.perimeterRadiusMm)) {
-        existing.perimeterRadiusMm = (existing.perimeterRadiusMm + perimeterRadiusMm) / 2;
-      } else {
-        existing.perimeterRadiusMm = perimeterRadiusMm;
-      }
-    }
+    existing.circularity = (existing.circularity + summary.circularity) / 2;
   }
 
   return unique;
@@ -1092,12 +1047,13 @@ function summarizeBends(edges, faceNormals) {
       if (!Number.isFinite(angleDeg)) {
         return;
       }
-      if (angleDeg >= BEND_MIN_ANGLE_DEG) {
+      if (angleDeg > 1) {
         bendCount += 1;
         sum += angleDeg;
         min = min === null ? angleDeg : Math.min(min, angleDeg);
         max = max === null ? angleDeg : Math.max(max, angleDeg);
-        const rounded = Math.round(angleDeg);
+
+        const rounded = Math.round(angleDeg / BEND_ANGLE_TOLERANCE_DEG) * BEND_ANGLE_TOLERANCE_DEG;
         const previous = histogram.has(rounded) ? histogram.get(rounded) : 0;
         histogram.set(rounded, previous + 1);
       }
@@ -1139,159 +1095,177 @@ function mergeAnalyses(meshAnalyses) {
       const existingCount = combined.bend.histogram.has(key) ? combined.bend.histogram.get(key) : 0;
       combined.bend.histogram.set(key, existingCount + count);
     });
+
+    if (analysis.flatPattern && analysis.flatPattern.isLikelyFlat) {
+      combined.flatPattern = analysis.flatPattern;
+    }
   }
 
   combined.loops = dedupeClosedLoops(combined.loops);
-  combined.totalBoundaryMm = combined.loops.reduce((sum, entry) => sum + entry.lengthMm, 0);
+  combined.totalCutLengthMm = combined.loops.reduce((sum, entry) => sum + entry.lengthMm, 0);
 
   const closedLoops = combined.loops.filter((loop) => loop.closed).sort((a, b) => b.lengthMm - a.lengthMm);
   const openLoops = combined.loops.filter((loop) => !loop.closed);
   combined.outerPerimeterMm = closedLoops.length ? closedLoops[0].lengthMm : null;
   combined.holes = closedLoops.length > 1 ? closedLoops.slice(1) : [];
   combined.openLoops = openLoops;
-  combined.circularHoleCount = combined.holes.filter((hole) => {
-    const score = hole && hole.circularity;
-    return Number.isFinite(score) ? score >= CIRCULARITY_CLASS_THRESHOLD : false;
-  }).length;
-  combined.nonCircularHoleCount = combined.holes.length - combined.circularHoleCount;
 
   return combined;
 }
 
-function formatAnalysis(analysis, decimals) {
+function formatLaserCutAnalysis(analysis, decimals) {
   if (!analysis) {
     return '';
   }
 
   const places = Number.isFinite(decimals) ? Math.max(0, decimals) : 2;
-  const inchPlaces = Math.max(2, Math.min(4, places + 1));
+  const formatMm = (value) => (value === null || value === undefined
+    ? '—'
+    : `${value.toFixed(places)} mm`);
+  const formatIn = (value) => (value === null || value === undefined
+    ? '—'
+    : `${(value * 0.0393700787).toFixed(places)} in`);
   const anglePlaces = Math.min(2, places);
-
-  const formatLengthPair = (value) => {
-    if (value === null || value === undefined) {
-      return null;
-    }
-    return {
-      mm: `${value.toFixed(places)} mm`,
-      inch: `${(value * MM_TO_INCH).toFixed(inchPlaces)} in`,
-    };
-  };
-
-  const formatCircularity = (value) => {
-    if (!Number.isFinite(value)) {
-      return '—';
-    }
-    return `${Math.round(THREE.MathUtils.clamp(value, 0, 1) * 100)}%`;
-  };
 
   const sections = [];
 
+  if (analysis.flatPattern && analysis.flatPattern.isLikelyFlat) {
+    sections.push(`
+      <div class="metric flat-pattern-detected">
+        <div class="metric-label">⚡ Flat pattern detected</div>
+        <div class="metric-sub">Ready for laser cutting (${analysis.flatPattern.largestPatchRatio ? (analysis.flatPattern.largestPatchRatio * 100).toFixed(0) : '?'}% planar)</div>
+      </div>
+    `);
+  } else if (analysis.bend && analysis.bend.bendCount > 0) {
+    sections.push(`
+      <div class="metric formed-part-warning">
+        <div class="metric-label">⚠️ Formed part detected</div>
+        <div class="metric-sub">This is a 3D bent part - measurements are approximate</div>
+        <div class="metric-sub">Export flat pattern from CAD for accurate laser cut data</div>
+      </div>
+    `);
+  }
+
+  if (analysis.totalCutLengthMm > 0) {
+    const totalInches = analysis.totalCutLengthMm * 0.0393700787;
+    sections.push(`
+      <div class="metric highlight">
+        <div class="metric-label">🔪 Total Cut Length</div>
+        <div class="metric-value">${formatMm(analysis.totalCutLengthMm)}</div>
+        <div class="metric-sub">${formatIn(analysis.totalCutLengthMm)} • ${(totalInches / 12).toFixed(2)} feet</div>
+      </div>
+    `);
+  }
+
   if (analysis.outerPerimeterMm !== null) {
-    const pair = formatLengthPair(analysis.outerPerimeterMm);
     sections.push(`
       <div class="metric">
-        <div class="metric-label">Edge perimeter</div>
-        <div class="metric-value">${pair.mm}</div>
-        <div class="metric-sub">${pair.inch}</div>
-      </div>
-    `);
-  } else if (analysis.totalBoundaryMm > 0) {
-    sections.push(`
-      <div class="metric">
-        <div class="metric-label">Edge perimeter</div>
-        <div class="metric-value">No closed boundary detected</div>
-      </div>
-    `);
-  } else {
-    sections.push(`
-      <div class="metric">
-        <div class="metric-label">Edge perimeter</div>
-        <div class="metric-value">Model is watertight</div>
+        <div class="metric-label">Outer Perimeter</div>
+        <div class="metric-value">${formatMm(analysis.outerPerimeterMm)}</div>
+        <div class="metric-sub">${formatIn(analysis.outerPerimeterMm)}</div>
       </div>
     `);
   }
 
   if (analysis.holes.length) {
-    const circularCount = analysis.circularHoleCount != null
-      ? analysis.circularHoleCount
-      : analysis.holes.filter((hole) => Number.isFinite(hole.circularity) && hole.circularity >= CIRCULARITY_CLASS_THRESHOLD).length;
-    const nonCircularCount = analysis.nonCircularHoleCount != null
-      ? analysis.nonCircularHoleCount
-      : analysis.holes.length - circularCount;
+    const circularHoles = analysis.holes.filter((h) => h.circularity >= CIRCULARITY_THRESHOLD);
+    const nonCircularHoles = analysis.holes.filter((h) => h.circularity < CIRCULARITY_THRESHOLD);
 
-    const holeItems = analysis.holes.slice(0, 5).map((hole, index) => {
-      const symbol = Number.isFinite(hole.circularity) && hole.circularity >= CIRCULARITY_CLASS_THRESHOLD ? '●' : '▢';
-      const diameterPair = formatLengthPair(hole.approxDiameterMm);
-      const perimeterPair = formatLengthPair(hole.lengthMm);
+    const totalHolePerimeter = analysis.holes.reduce((sum, h) => sum + h.lengthMm, 0);
+
+    const holeItems = analysis.holes.slice(0, 8).map((hole, index) => {
+      const isCircular = hole.circularity >= CIRCULARITY_THRESHOLD;
+      const shape = isCircular ? '●' : '▢';
+      const radius = hole.approxDiameterMm / 2;
+      const diameter = hole.approxDiameterMm;
+
+      if (isCircular) {
+        return `
+          <li>${shape} Hole ${index + 1}: Ø${diameter.toFixed(places)}mm (${(diameter * 0.0393700787).toFixed(places)}in)
+            <span class="metric-sub">R${radius.toFixed(places)}mm • ${(hole.circularity * 100).toFixed(0)}% circular</span>
+          </li>
+        `;
+      }
       return `
-        <li>${symbol} Hole ${index + 1}: Ø ${diameterPair ? diameterPair.mm : '—'}
-          ${diameterPair ? `<span class="metric-sub">${diameterPair.inch}</span>` : ''}
-          <span class="metric-sub">Circularity ${formatCircularity(hole.circularity)}</span>
-          ${perimeterPair ? `<span class="metric-sub">Perimeter ${perimeterPair.mm} (${perimeterPair.inch})</span>` : ''}
+        <li>${shape} Feature ${index + 1}: ${formatMm(hole.lengthMm)} perimeter
+          <span class="metric-sub">~${formatMm(hole.approxDiameterMm)} max span • slot/rectangle</span>
         </li>
       `;
     }).join('');
-    const more = analysis.holes.length > 5 ? `<li class="metric-sub">…${analysis.holes.length - 5} more</li>` : '';
+    const more = analysis.holes.length > 8 ? `<li class="metric-sub">…${analysis.holes.length - 8} more features</li>` : '';
+
+    const summary = circularHoles.length > 0 && nonCircularHoles.length > 0
+      ? `${circularHoles.length} round, ${nonCircularHoles.length} slots/features`
+      : circularHoles.length > 0
+        ? `${circularHoles.length} round holes`
+        : `${nonCircularHoles.length} slots/features`;
+
     sections.push(`
       <div class="metric">
-        <div class="metric-label">Holes</div>
+        <div class="metric-label">Holes & Features</div>
         <div class="metric-value">${analysis.holes.length} total</div>
-        <div class="metric-sub">● ${circularCount} circular · ▢ ${nonCircularCount} other</div>
+        <div class="metric-sub">${summary}</div>
+        <div class="metric-sub">Internal cuts: ${formatMm(totalHolePerimeter)}</div>
         <ul class="metric-list">${holeItems}${more}</ul>
       </div>
     `);
   } else {
     sections.push(`
       <div class="metric">
-        <div class="metric-label">Holes</div>
-        <div class="metric-value">0</div>
+        <div class="metric-label">Holes & Features</div>
+        <div class="metric-value">None detected</div>
       </div>
     `);
   }
 
   if (analysis.openLoops.length) {
     const openLength = analysis.openLoops.reduce((sum, loop) => sum + loop.lengthMm, 0);
-    const pair = formatLengthPair(openLength);
     sections.push(`
       <div class="metric">
-        <div class="metric-label">Open edges</div>
-        <div class="metric-value">${pair ? pair.mm : '—'}</div>
-        ${pair ? `<div class="metric-sub">${pair.inch}</div>` : ''}
-        <div class="metric-sub">${analysis.openLoops.length} open chains</div>
+        <div class="metric-label">⚠️ Open/Incomplete Edges</div>
+        <div class="metric-value">${formatMm(openLength)}</div>
+        <div class="metric-sub">${analysis.openLoops.length} open chains (check model integrity)</div>
       </div>
     `);
   }
 
   const bend = analysis.bend;
-  if (bend && bend.candidateEdges > 0) {
-    let bendSummary = '<div class="metric-sub">No bends detected</div>';
-    if (bend.bendCount > 0) {
-      const average = bend.sum / bend.bendCount;
-      const minText = bend.min !== null && bend.min !== undefined ? bend.min.toFixed(anglePlaces) : '—';
-      const maxText = bend.max !== null && bend.max !== undefined ? bend.max.toFixed(anglePlaces) : '—';
-      bendSummary = `
-        <div class="metric-sub">${bend.bendCount} of ${bend.candidateEdges} shared edges</div>
-        <div class="metric-sub">avg ${average.toFixed(anglePlaces)}°, range ${minText}° – ${maxText}°</div>
-      `;
-    }
+  if (bend && bend.bendCount > 0) {
+    const average = bend.sum / bend.bendCount;
+    const minText = bend.min !== null && bend.min !== undefined ? bend.min.toFixed(anglePlaces) : '—';
+    const maxText = bend.max !== null && bend.max !== undefined ? bend.max.toFixed(anglePlaces) : '—';
+
+    const commonAngles = [90, 45, 30, 135, 120, 60, 180];
+    const detectedCommon = [];
+    commonAngles.forEach((targetAngle) => {
+      let count = 0;
+      bend.histogram.forEach((c, angle) => {
+        if (Math.abs(angle - targetAngle) <= BEND_ANGLE_TOLERANCE_DEG) {
+          count += c;
+        }
+      });
+      if (count > 0) {
+        detectedCommon.push(`${targetAngle}° (×${count})`);
+      }
+    });
 
     const histEntries = Array.from(bend.histogram.entries())
       .sort((a, b) => b[1] - a[1])
-      .slice(0, 5)
+      .slice(0, 6)
       .map(([angle, count]) => {
-        const highlight = COMMON_BEND_ANGLES.some((target) => Math.abs(target - angle) <= BEND_HIGHLIGHT_TOLERANCE_DEG);
-        const label = highlight ? `${angle}° ★` : `${angle}°`;
-        return `<li>${label} – ${count}</li>`;
+        const isCommon = commonAngles.some((a) => Math.abs(angle - a) <= BEND_ANGLE_TOLERANCE_DEG);
+        const marker = isCommon ? '★' : '';
+        return `<li>${marker} ${angle}° – ${count} edge${count > 1 ? 's' : ''}</li>`;
       })
       .join('');
-    const histHtml = histEntries ? `<ul class="metric-list">${histEntries}</ul>` : '';
 
     sections.push(`
       <div class="metric">
-        <div class="metric-label">Bend angles</div>
-        <div class="metric-value">${bend.bendCount}</div>
-        ${bendSummary}
-        ${histHtml}
+        <div class="metric-label">Bend Information</div>
+        <div class="metric-value">${bend.bendCount} bends detected</div>
+        <div class="metric-sub">avg ${average.toFixed(anglePlaces)}°, range ${minText}° – ${maxText}°</div>
+        ${detectedCommon.length ? `<div class="metric-sub">Common angles: ${detectedCommon.join(', ')}</div>` : ''}
+        <ul class="metric-list">${histEntries}</ul>
       </div>
     `);
   }
