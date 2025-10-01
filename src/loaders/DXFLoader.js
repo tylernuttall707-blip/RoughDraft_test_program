@@ -84,6 +84,15 @@ export class DXFLoader {
     if (typeof text !== 'string') {
       throw new Error('DXFLoader.parse requires a DXF file as a string.');
     }
+
+    // Reset metadata so each parse call reports fresh information
+    this.metadata = {
+      units: null,
+      bounds: null,
+      layerCount: 0,
+      entityCounts: {},
+    };
+
     const pairs = parsePairs(text);
     if (!pairs.length) {
       throw new Error('DXFLoader: the provided file does not contain any DXF data.');
