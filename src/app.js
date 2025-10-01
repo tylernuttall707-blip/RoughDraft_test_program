@@ -236,12 +236,17 @@ function dimsFromBounds(bounds) {
   };
 }
 
-function analyzeSheetMetal(group) {
+function analyzeSheetMetal(group, metadata = null) {
   if (!group) {
     return createEmptyAnalysis();
   }
 
   group.updateMatrixWorld(true);
+
+  // For DXF files with metadata, use entity-aware analysis
+  if (metadata && metadata.kind === 'dxf') {
+    return analyzeDxfEntities(group, metadata);
+  }
 
   const perMesh = [];
   group.traverse((child) => {
@@ -268,6 +273,151 @@ function analyzeSheetMetal(group) {
   }
 
   return mergeAnalyses(perMesh);
+}
+
+function analyzeDxfEntities(group, metadata) {
+  const analysis = createEmptyAnalysis();
+  const allLoops = [];
+  let totalLength = 0;
+
+  group.traverse((child) => {
+    if (!child || !child.geometry) return;
+
+    const isClosed = child.type === 'LineLoop';
+    const geometry = child.geometry;
+    const positionAttr = geometry.getAttribute('position');
+    if (!positionAttr) return;
+
+    const matrix = child.matrixWorld || new THREE.Matrix4();
+    const points = [];
+    const temp = new THREE.Vector3();
+
+    for (let i = 0; i < positionAttr.count; i += 1) {
+      temp.set(positionAttr.getX(i), positionAttr.getY(i), positionAttr.getZ(i));
+      temp.applyMatrix4(matrix);
+      points.push(temp.clone());
+    }
+
+    if (points.length < 2) return;
+
+    // Calculate loop properties
+    let length = 0;
+    for (let i = 0; i < points.length - 1; i += 1) {
+      length += points[i].distanceTo(points[i + 1]);
+    }
+
+    // For closed loops, check if we need to close the loop
+    let vertices = points;
+    if (isClosed && points.length > 2) {
+      const first = points[0];
+      const last = points[points.length - 1];
+      if (first.distanceTo(last) > VERTEX_MERGE_TOLERANCE) {
+        vertices = [...points, points[0].clone()];
+        length += last.distanceTo(first);
+      }
+    }
+
+    if (!isClosed || length < 0.01) {
+      if (!isClosed && length > 0.01) {
+        analysis.openLoops.push({
+          closed: false,
+          lengthMm: length,
+          approxDiameterMm: 0,
+          vertexCount: points.length,
+          centroid: null,
+          circularity: 0,
+        });
+        totalLength += length;
+      }
+      return;
+    }
+
+    // Calculate circularity for closed loops
+    let centroid = new THREE.Vector3();
+    let maxDistSq = 0;
+
+    for (let i = 0; i < points.length; i += 1) {
+      centroid.add(points[i]);
+      for (let j = i + 1; j < points.length; j += 1) {
+        const distSq = points[i].distanceToSquared(points[j]);
+        if (distSq > maxDistSq) maxDistSq = distSq;
+      }
+    }
+
+    if (points.length) {
+      centroid.multiplyScalar(1 / points.length);
+    }
+
+    const approxDiameterMm = Math.sqrt(Math.max(maxDistSq, 0));
+
+    // Enhanced circularity calculation
+    let circularity = 0;
+    if (points.length >= 4) {
+      const perimeterBasedRadius = length / (2 * Math.PI);
+      let avgDistanceFromCentroid = 0;
+
+      for (const point of points) {
+        avgDistanceFromCentroid += point.distanceTo(centroid);
+      }
+      avgDistanceFromCentroid /= points.length;
+
+      let distanceVariance = 0;
+      for (const point of points) {
+        const dist = point.distanceTo(centroid);
+        distanceVariance += Math.pow(dist - avgDistanceFromCentroid, 2);
+      }
+      distanceVariance /= points.length;
+      const stdDev = Math.sqrt(distanceVariance);
+
+      const coefficientOfVariation = avgDistanceFromCentroid > 0 ? stdDev / avgDistanceFromCentroid : 1;
+      circularity = Math.max(0, 1 - coefficientOfVariation * 5);
+
+      const radiusRatio = avgDistanceFromCentroid > 0
+        ? Math.min(perimeterBasedRadius, avgDistanceFromCentroid) / Math.max(perimeterBasedRadius, avgDistanceFromCentroid)
+        : 0;
+      circularity = (circularity + radiusRatio) / 2;
+
+      // Boost circularity for entities with many segments (likely from CIRCLE entities)
+      if (points.length >= 32) {
+        circularity = Math.max(circularity, 0.85);
+      }
+    }
+
+    allLoops.push({
+      closed: true,
+      lengthMm: length,
+      approxDiameterMm,
+      vertexCount: points.length,
+      centroid,
+      circularity,
+    });
+    totalLength += length;
+  });
+
+  // Deduplicate closed loops
+  const uniqueLoops = dedupeClosedLoops(allLoops.filter(l => l.closed));
+  const openLoops = allLoops.filter(l => !l.closed);
+
+  // Sort by perimeter length (largest first)
+  uniqueLoops.sort((a, b) => b.lengthMm - a.lengthMm);
+
+  // The largest loop is likely the outer perimeter
+  if (uniqueLoops.length > 0) {
+    analysis.outerPerimeterMm = uniqueLoops[0].lengthMm;
+    analysis.holes = uniqueLoops.slice(1);
+  }
+
+  analysis.loops = [...uniqueLoops, ...openLoops];
+  analysis.openLoops = openLoops;
+  analysis.totalCutLengthMm = totalLength;
+  analysis.flatPattern = {
+    isLikelyFlat: true,
+    dominantPlane: 'Z',
+    largestPatchRatio: 1,
+    aspectRatio: 0,
+  };
+
+  return analysis;
 }
 
 function createEmptyBendStats() {

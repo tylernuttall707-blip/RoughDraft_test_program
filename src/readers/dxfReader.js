@@ -236,7 +236,7 @@ export async function loadDxf(file, card, viewport, options = {}) {
   }
 
   const dimsMm = dimsFromBounds(bounds);
-  const analysis = analyzeSheetMetal(group);
+  const analysis = analyzeSheetMetal(group, metadata);
 
   const name = `${file.name}`;
   const precisionValue = precisionEl && precisionEl.value !== undefined ? precisionEl.value : '3';
