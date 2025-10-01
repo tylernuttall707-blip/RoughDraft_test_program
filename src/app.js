@@ -514,12 +514,13 @@ function analyzeGeometry(geometry, matrixWorld) {
   }
 
   const loopSummaries = loops.map((loop) => summarizeLoop(loop, uniqueVertices));
-  const totalBoundaryMm = loopSummaries.reduce((sum, entry) => sum + entry.lengthMm, 0);
+  const uniqueLoopSummaries = dedupeClosedLoops(loopSummaries);
+  const totalBoundaryMm = uniqueLoopSummaries.reduce((sum, entry) => sum + entry.lengthMm, 0);
 
   const bendStats = summarizeBends(edges, faceNormals);
 
   return {
-    loops: loopSummaries,
+    loops: uniqueLoopSummaries,
     totalBoundaryMm,
     bend: bendStats,
   };
@@ -553,12 +554,63 @@ function summarizeLoop(loop, vertices) {
 
   const approxDiameterMm = Math.sqrt(Math.max(maxDistSq, 0));
 
+  let centroid = null;
+  if (loop.closed && points.length) {
+    centroid = new THREE.Vector3();
+    for (const index of points) {
+      const vertex = vertices[index];
+      if (vertex) {
+        centroid.add(vertex);
+      }
+    }
+    centroid.multiplyScalar(1 / points.length);
+  }
+
   return {
     closed: loop.closed,
     lengthMm: length,
     approxDiameterMm,
     vertexCount: points.length,
+    centroid,
   };
+}
+
+function dedupeClosedLoops(loopSummaries) {
+  if (!loopSummaries.length) {
+    return loopSummaries;
+  }
+
+  const tolerance = 1e-3;
+  const quantize = (value) => Math.round(value / tolerance);
+  const seen = new Map();
+  const unique = [];
+
+  for (const summary of loopSummaries) {
+    if (!summary.closed || !summary.centroid) {
+      unique.push(summary);
+      continue;
+    }
+
+    const { centroid, lengthMm, vertexCount, approxDiameterMm } = summary;
+    const key = `${quantize(centroid.x)}|${quantize(centroid.y)}|${quantize(lengthMm)}|${vertexCount}`;
+    const existing = seen.get(key);
+    if (!existing) {
+      seen.set(key, summary);
+      unique.push(summary);
+      continue;
+    }
+
+    if (existing.centroid && centroid) {
+      existing.centroid = existing.centroid.clone().add(centroid).multiplyScalar(0.5);
+    }
+    existing.lengthMm = (existing.lengthMm + lengthMm) / 2;
+    existing.approxDiameterMm = Number.isFinite(existing.approxDiameterMm) && Number.isFinite(approxDiameterMm)
+      ? (existing.approxDiameterMm + approxDiameterMm) / 2
+      : existing.approxDiameterMm;
+    existing.vertexCount = Math.max(existing.vertexCount ?? 0, vertexCount ?? 0);
+  }
+
+  return unique;
 }
 
 function summarizeBends(edges, faceNormals) {
@@ -609,7 +661,6 @@ function mergeAnalyses(meshAnalyses) {
 
   for (const analysis of meshAnalyses) {
     combined.loops.push(...analysis.loops);
-    combined.totalBoundaryMm += analysis.totalBoundaryMm;
 
     combined.bend.totalEdges += analysis.bend.totalEdges;
     combined.bend.candidateEdges += analysis.bend.candidateEdges;
@@ -629,6 +680,9 @@ function mergeAnalyses(meshAnalyses) {
       combined.bend.histogram.set(key, (combined.bend.histogram.get(key) ?? 0) + count);
     });
   }
+
+  combined.loops = dedupeClosedLoops(combined.loops);
+  combined.totalBoundaryMm = combined.loops.reduce((sum, entry) => sum + entry.lengthMm, 0);
 
   const closedLoops = combined.loops.filter((loop) => loop.closed).sort((a, b) => b.lengthMm - a.lengthMm);
   const openLoops = combined.loops.filter((loop) => !loop.closed);
