@@ -25,6 +25,9 @@ const unitToMillimeter = {
 };
 
 function initViewer() {
+  if (!viewerManager) {
+    viewerManager = new ViewerManager(viewerEl);
+  }
   viewerManager.initialize();
 }
 
@@ -554,7 +557,6 @@ class ModelViewport {
   }
 }
 
-viewerManager = new ViewerManager(viewerEl);
 initViewer();
 attachUiHandlers();
 
