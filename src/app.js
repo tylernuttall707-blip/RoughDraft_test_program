@@ -24,6 +24,9 @@ const unitToMillimeter = {
   ft: 304.8,
 };
 
+const PLANAR_ANGLE_THRESHOLD_DEG = 8;
+const LOOP_AXIS_IGNORE_TOLERANCE = 1e-3;
+
 function initViewer() {
   if (!viewerManager) {
     viewerManager = new ViewerManager(viewerEl);
@@ -397,6 +400,7 @@ function analyzeGeometry(geometry, matrixWorld) {
   const getEdgeKey = (a, b) => (a < b ? `${a}|${b}` : `${b}|${a}`);
 
   const faceNormals = [];
+  const faceCentroids = [];
   const edges = new Map();
   const addEdge = (a, b, faceIdx) => {
     const key = getEdgeKey(a, b);
@@ -423,6 +427,8 @@ function analyzeGeometry(geometry, matrixWorld) {
       normal.normalize();
     }
     faceNormals[faceIdx] = normal;
+    const centroid = new THREE.Vector3().addVectors(a, b).add(c).multiplyScalar(1 / 3);
+    faceCentroids[faceIdx] = centroid;
     addEdge(aIdx, bIdx, faceIdx);
     addEdge(bIdx, cIdx, faceIdx);
     addEdge(cIdx, aIdx, faceIdx);
@@ -451,67 +457,205 @@ function analyzeGeometry(geometry, matrixWorld) {
     }
   }
 
-  const adjacency = new Map();
-  const boundaryEdges = [];
+  const bounds = new THREE.Box3();
+  if (uniqueVertices.length) {
+    bounds.setFromPoints(uniqueVertices);
+  }
+  const boundsSize = new THREE.Vector3();
+  bounds.getSize(boundsSize);
+  const scale = boundsSize.length() || 1;
+  const planeOffsetTolerance = Math.max(scale * 1e-4, 1e-4);
+  const planarDotThreshold = Math.cos(THREE.MathUtils.degToRad(PLANAR_ANGLE_THRESHOLD_DEG));
+
+  const faceNeighbors = Array.from({ length: faceNormals.length }, () => new Set());
   edges.forEach((edge) => {
-    if (edge.faces.length <= 1) {
-      boundaryEdges.push(edge);
-      if (!adjacency.has(edge.a)) adjacency.set(edge.a, new Set());
-      if (!adjacency.has(edge.b)) adjacency.set(edge.b, new Set());
-      adjacency.get(edge.a).add(edge.b);
-      adjacency.get(edge.b).add(edge.a);
+    if (edge.faces.length >= 2) {
+      for (let i = 0; i < edge.faces.length; i += 1) {
+        for (let j = i + 1; j < edge.faces.length; j += 1) {
+          const aFace = edge.faces[i];
+          const bFace = edge.faces[j];
+          if (faceNeighbors[aFace]) faceNeighbors[aFace].add(bFace);
+          if (faceNeighbors[bFace]) faceNeighbors[bFace].add(aFace);
+        }
+      }
     }
   });
 
-  const loops = [];
-  const visitedEdges = new Set();
-  const findNextNeighbor = (current, prev) => {
-    const neighbors = adjacency.get(current);
-    if (!neighbors) {
-      return null;
-    }
-    for (const neighbor of neighbors) {
-      if (neighbor === prev) continue;
-      const key = getEdgeKey(current, neighbor);
-      if (visitedEdges.has(key)) {
-        continue;
-      }
-      return neighbor;
-    }
-    return null;
-  };
+  const facePatch = new Array(faceNormals.length).fill(-1);
+  const patches = [];
 
-  for (const edge of boundaryEdges) {
-    const initialKey = getEdgeKey(edge.a, edge.b);
-    if (visitedEdges.has(initialKey)) {
+  for (let faceIdx = 0; faceIdx < faceNormals.length; faceIdx += 1) {
+    if (facePatch[faceIdx] !== -1) {
       continue;
     }
-    const loop = [edge.a];
-    let current = edge.a;
-    let next = edge.b;
-    let closed = false;
-    let guard = 0;
-    while (next !== null && guard < boundaryEdges.length * 4) {
-      guard += 1;
-      loop.push(next);
-      const stepKey = getEdgeKey(current, next);
-      visitedEdges.add(stepKey);
-      if (next === loop[0]) {
-        closed = true;
-        break;
-      }
-      const candidate = findNextNeighbor(next, current);
-      if (candidate === null) {
-        break;
-      }
-      current = next;
-      next = candidate;
+    const normal = faceNormals[faceIdx];
+    const centroid = faceCentroids[faceIdx];
+    if (!normal || normal.lengthSq() === 0 || !centroid) {
+      continue;
     }
-    loops.push({
-      vertices: loop,
-      closed,
-    });
+
+    const patchId = patches.length;
+    const patch = {
+      faces: [faceIdx],
+      normal: normal.clone().normalize(),
+      normalSum: normal.clone(),
+      planePointSum: centroid.clone(),
+      planeConstant: normal.clone().normalize().dot(centroid),
+      count: 1,
+    };
+    patches.push(patch);
+    facePatch[faceIdx] = patchId;
+
+    const queue = [faceIdx];
+    while (queue.length) {
+      const currentFace = queue.pop();
+      const neighbors = faceNeighbors[currentFace];
+      if (!neighbors) {
+        continue;
+      }
+      neighbors.forEach((neighborIdx) => {
+        if (facePatch[neighborIdx] !== -1) {
+          return;
+        }
+        const neighborNormal = faceNormals[neighborIdx];
+        const neighborCentroid = faceCentroids[neighborIdx];
+        if (!neighborNormal || neighborNormal.lengthSq() === 0 || !neighborCentroid) {
+          return;
+        }
+        const dot = patch.normal.dot(neighborNormal);
+        if (dot < planarDotThreshold) {
+          return;
+        }
+        const distance = Math.abs(patch.normal.dot(neighborCentroid) - patch.planeConstant);
+        if (distance > planeOffsetTolerance) {
+          return;
+        }
+
+        facePatch[neighborIdx] = patchId;
+        patch.faces.push(neighborIdx);
+        queue.push(neighborIdx);
+        patch.normalSum.add(neighborNormal);
+        patch.planePointSum.add(neighborCentroid);
+        patch.count += 1;
+        patch.normal = patch.normalSum.clone().normalize();
+        const avgPoint = patch.planePointSum.clone().multiplyScalar(1 / patch.count);
+        patch.planeConstant = patch.normal.dot(avgPoint);
+      });
+    }
   }
+
+  const patchEdges = new Map();
+  const ensurePatchEdges = (patchId) => {
+    if (!patchEdges.has(patchId)) {
+      patchEdges.set(patchId, []);
+    }
+    return patchEdges.get(patchId);
+  };
+
+  edges.forEach((edge) => {
+    const { faces } = edge;
+    if (!faces.length) {
+      return;
+    }
+
+    const patchesForEdge = new Set();
+    for (const faceIdx of faces) {
+      const assigned = facePatch[faceIdx];
+      if (assigned !== undefined && assigned !== -1) {
+        patchesForEdge.add(assigned);
+      }
+    }
+
+    if (faces.length === 1) {
+      const onlyPatch = facePatch[faces[0]];
+      if (onlyPatch !== undefined && onlyPatch !== -1) {
+        ensurePatchEdges(onlyPatch).push(edge);
+      }
+      return;
+    }
+
+    const patchesArray = Array.from(patchesForEdge);
+    if (patchesArray.length <= 1) {
+      if (patchesArray.length === 1 && faces.length === 1) {
+        ensurePatchEdges(patchesArray[0]).push(edge);
+      }
+      return;
+    }
+
+    patchesArray.forEach((patchId) => {
+      ensurePatchEdges(patchId).push(edge);
+    });
+  });
+
+  const loops = [];
+
+  patchEdges.forEach((edgeList) => {
+    if (!edgeList.length) {
+      return;
+    }
+    const adjacency = new Map();
+    const visitedEdges = new Set();
+    const addNeighbor = (from, to) => {
+      if (!adjacency.has(from)) {
+        adjacency.set(from, new Set());
+      }
+      adjacency.get(from).add(to);
+    };
+
+    edgeList.forEach((edge) => {
+      addNeighbor(edge.a, edge.b);
+      addNeighbor(edge.b, edge.a);
+    });
+
+    const findNextNeighbor = (current, prev) => {
+      const neighbors = adjacency.get(current);
+      if (!neighbors) {
+        return null;
+      }
+      for (const neighbor of neighbors) {
+        if (neighbor === prev) continue;
+        const key = getEdgeKey(current, neighbor);
+        if (visitedEdges.has(key)) {
+          continue;
+        }
+        return neighbor;
+      }
+      return null;
+    };
+
+    for (const edge of edgeList) {
+      const initialKey = getEdgeKey(edge.a, edge.b);
+      if (visitedEdges.has(initialKey)) {
+        continue;
+      }
+      const loop = [edge.a];
+      let current = edge.a;
+      let next = edge.b;
+      let closed = false;
+      let guard = 0;
+      const guardLimit = edgeList.length * 4;
+      while (next !== null && guard < guardLimit) {
+        guard += 1;
+        loop.push(next);
+        const stepKey = getEdgeKey(current, next);
+        visitedEdges.add(stepKey);
+        if (next === loop[0]) {
+          closed = true;
+          break;
+        }
+        const candidate = findNextNeighbor(next, current);
+        if (candidate === null) {
+          break;
+        }
+        current = next;
+        next = candidate;
+      }
+      loops.push({
+        vertices: loop,
+        closed,
+      });
+    }
+  });
 
   const loopSummaries = loops.map((loop) => summarizeLoop(loop, uniqueVertices));
   const uniqueLoopSummaries = dedupeClosedLoops(loopSummaries);
@@ -530,6 +674,8 @@ function summarizeLoop(loop, vertices) {
   const points = loop.closed ? loop.vertices.slice(0, -1) : loop.vertices.slice();
   const ordered = loop.vertices;
   let length = 0;
+  const boundsMin = new THREE.Vector3(Infinity, Infinity, Infinity);
+  const boundsMax = new THREE.Vector3(-Infinity, -Infinity, -Infinity);
   for (let i = 0; i < ordered.length - 1; i += 1) {
     const start = vertices[ordered[i]];
     const end = vertices[ordered[i + 1]];
@@ -542,6 +688,8 @@ function summarizeLoop(loop, vertices) {
   for (let i = 0; i < points.length; i += 1) {
     const a = vertices[points[i]];
     if (!a) continue;
+    boundsMin.min(a);
+    boundsMax.max(a);
     for (let j = i + 1; j < points.length; j += 1) {
       const b = vertices[points[j]];
       if (!b) continue;
@@ -555,6 +703,7 @@ function summarizeLoop(loop, vertices) {
   const approxDiameterMm = Math.sqrt(Math.max(maxDistSq, 0));
 
   let centroid = null;
+  let axisToIgnore = null;
   if (loop.closed && points.length) {
     centroid = new THREE.Vector3();
     for (const index of points) {
@@ -564,6 +713,19 @@ function summarizeLoop(loop, vertices) {
       }
     }
     centroid.multiplyScalar(1 / points.length);
+
+    const extent = new THREE.Vector3().subVectors(boundsMax, boundsMin);
+    const axes = [
+      { axis: 'x', value: extent.x },
+      { axis: 'y', value: extent.y },
+      { axis: 'z', value: extent.z },
+    ].sort((a, b) => a.value - b.value);
+    if (axes.length) {
+      const nextValue = axes[1]?.value ?? axes[0].value || 0;
+      if (axes[0].value <= LOOP_AXIS_IGNORE_TOLERANCE || axes[0].value <= nextValue * 0.2) {
+        axisToIgnore = axes[0].axis;
+      }
+    }
   }
 
   return {
@@ -572,6 +734,7 @@ function summarizeLoop(loop, vertices) {
     approxDiameterMm,
     vertexCount: points.length,
     centroid,
+    axisToIgnore,
   };
 }
 
@@ -591,8 +754,14 @@ function dedupeClosedLoops(loopSummaries) {
       continue;
     }
 
-    const { centroid, lengthMm, vertexCount, approxDiameterMm } = summary;
-    const key = `${quantize(centroid.x)}|${quantize(centroid.y)}|${quantize(lengthMm)}|${vertexCount}`;
+    const { centroid, lengthMm, vertexCount, approxDiameterMm, axisToIgnore } = summary;
+    const centroidKey = [
+      axisToIgnore === 'x' ? '_' : quantize(centroid.x),
+      axisToIgnore === 'y' ? '_' : quantize(centroid.y),
+      axisToIgnore === 'z' ? '_' : quantize(centroid.z),
+    ].join('|');
+    const diameterKey = Number.isFinite(approxDiameterMm) ? quantize(approxDiameterMm) : 'nan';
+    const key = `${centroidKey}|${quantize(lengthMm)}|${vertexCount}|${diameterKey}`;
     const existing = seen.get(key);
     if (!existing) {
       seen.set(key, summary);
@@ -608,6 +777,9 @@ function dedupeClosedLoops(loopSummaries) {
       ? (existing.approxDiameterMm + approxDiameterMm) / 2
       : existing.approxDiameterMm;
     existing.vertexCount = Math.max(existing.vertexCount ?? 0, vertexCount ?? 0);
+    if (!existing.axisToIgnore && axisToIgnore) {
+      existing.axisToIgnore = axisToIgnore;
+    }
   }
 
   return unique;
